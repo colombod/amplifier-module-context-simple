@@ -1,0 +1,2 @@
+[amplifier.modules]
+context-simple = amplifier_mod_context_simple:mount
