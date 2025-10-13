@@ -2,6 +2,21 @@
 
 Basic message list context manager for conversation state.
 
+## Prerequisites
+
+- **Python 3.11+**
+- **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
+
+### Installing UV
+
+```bash
+# macOS/Linux/WSL
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
 ## Purpose
 
 Provides straightforward in-memory conversation context management. This is the reference implementation and default context manager.
@@ -10,7 +25,7 @@ Provides straightforward in-memory conversation context management. This is the 
 
 **Module Type:** Context
 **Mount Point:** `contexts`
-**Entry Point:** `amplifier_mod_context_simple:mount`
+**Entry Point:** `amplifier_module_context_simple:mount`
 
 ## Behavior
 
@@ -39,11 +54,13 @@ context = "context-simple"
 ```
 
 Perfect for:
+
 - Development and testing
 - Short conversations
 - Stateless applications
 
 Not suitable for:
+
 - Long-running sessions
 - Cross-session persistence
 - Token budget management
