@@ -91,6 +91,12 @@ class SimpleContextManager:
         self._recalculate_tokens()
         logger.info(f"Compacted to {len(self.messages)} messages")
 
+    async def set_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Set messages from a saved transcript (for session resume)."""
+        self.messages = messages.copy()
+        self._recalculate_tokens()
+        logger.info(f"Restored {len(messages)} messages to context")
+
     async def clear(self) -> None:
         """Clear all messages."""
         self.messages = []
