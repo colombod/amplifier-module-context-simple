@@ -6,7 +6,6 @@ during compaction, preventing Anthropic API errors.
 """
 
 import pytest
-
 from amplifier_module_context_simple import SimpleContextManager
 
 
@@ -50,7 +49,9 @@ async def test_compact_preserves_tool_pairs_scenario_a():
     has_tool_use = any(m.get("role") == "assistant" and m.get("tool_calls") for m in messages)
     has_tool_result = any(m.get("role") == "tool" for m in messages)
 
-    assert has_tool_use == has_tool_result, f"Tool pair broken! has_tool_use={has_tool_use}, has_tool_result={has_tool_result}"
+    assert has_tool_use == has_tool_result, (
+        f"Tool pair broken! has_tool_use={has_tool_use}, has_tool_result={has_tool_result}"
+    )
 
     # If tool_use present, verify tool_result immediately follows
     for i, msg in enumerate(messages):
@@ -58,7 +59,7 @@ async def test_compact_preserves_tool_pairs_scenario_a():
             assert i + 1 < len(messages), f"Tool_use at message {i} but no next message"
             next_msg = messages[i + 1]
             assert next_msg.get("role") == "tool", (
-                f"Tool_use at message {i} not followed by tool message " f"(found role={next_msg.get('role')})"
+                f"Tool_use at message {i} not followed by tool message (found role={next_msg.get('role')})"
             )
 
 
@@ -107,7 +108,9 @@ async def test_compact_preserves_tool_pairs_scenario_b():
     tool_use_count = sum(1 for m in messages if m.get("role") == "assistant" and m.get("tool_calls"))
     tool_result_count = sum(1 for m in messages if m.get("role") == "tool")
 
-    assert tool_use_count == tool_result_count, f"Tool pair count mismatch! tool_use={tool_use_count}, tool_result={tool_result_count}"
+    assert tool_use_count == tool_result_count, (
+        f"Tool pair count mismatch! tool_use={tool_use_count}, tool_result={tool_result_count}"
+    )
 
     # Verify adjacency
     for i, msg in enumerate(messages):
@@ -126,14 +129,22 @@ async def test_compact_never_deduplicates_tool_messages():
     await context.add_message({"role": "user", "content": "test"})
 
     await context.add_message(
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_1", "tool": "bash", "arguments": {"cmd": "ls"}}]}
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "toolu_1", "tool": "bash", "arguments": {"cmd": "ls"}}],
+        }
     )
     await context.add_message({"role": "tool", "tool_call_id": "toolu_1", "content": "file1.txt"})
 
     await context.add_message({"role": "user", "content": "test again"})
 
     await context.add_message(
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_2", "tool": "bash", "arguments": {"cmd": "ls"}}]}
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "toolu_2", "tool": "bash", "arguments": {"cmd": "ls"}}],
+        }
     )
     await context.add_message({"role": "tool", "tool_call_id": "toolu_2", "content": "file1.txt"})
 

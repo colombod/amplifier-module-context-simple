@@ -141,14 +141,14 @@ class SimpleContextManager:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 if i + 1 < len(self.messages):
                     expanded.add(i + 1)
-                    logger.debug(f"Preserving tool pair: message {i} (tool_use) + {i+1} (tool_result)")
+                    logger.debug(f"Preserving tool pair: message {i} (tool_use) + {i + 1} (tool_result)")
 
             # If keeping tool message, MUST keep previous assistant
             elif msg.get("role") == "tool" and i > 0:
                 prev_msg = self.messages[i - 1]
                 if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
                     expanded.add(i - 1)
-                    logger.debug(f"Preserving tool pair: message {i-1} (tool_use) + {i} (tool_result)")
+                    logger.debug(f"Preserving tool pair: message {i - 1} (tool_use) + {i} (tool_result)")
 
         # Step 3: Build ordered compacted list
         compacted = [self.messages[i] for i in sorted(expanded)]
@@ -159,9 +159,7 @@ class SimpleContextManager:
 
         for msg in compacted:
             # Never deduplicate tool-related messages (each is unique by ID)
-            if msg.get("role") == "tool":
-                final.append(msg)
-            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+            if msg.get("role") == "tool" or msg.get("role") == "assistant" and msg.get("tool_calls"):
                 final.append(msg)
             else:
                 # Normal deduplication for non-tool messages
@@ -178,7 +176,8 @@ class SimpleContextManager:
         tool_use_count = sum(1 for m in final if m.get("tool_calls"))
         tool_result_count = sum(1 for m in final if m.get("role") == "tool")
         logger.info(
-            f"Compacted {old_count} → {len(final)} messages " f"({tool_use_count} tool pairs preserved)"
+            f"Compacted {old_count} → {len(final)} messages "
+            f"({tool_use_count} tool_use, {tool_result_count} tool_result pairs preserved)"
         )
 
     async def set_messages(self, messages: list[dict[str, Any]]) -> None:
