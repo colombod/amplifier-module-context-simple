@@ -31,8 +31,8 @@ Provides straightforward in-memory conversation context management. This is the 
 
 - In-memory message list
 - No persistence across sessions
-- No automatic summarization or compaction
-- Simple append-only operations
+- Automatic compaction when approaching token limit (keeps system messages + last 10 messages)
+- **Preserves tool pairs as atomic units** during compaction (data integrity guarantee)
 
 ## Configuration
 
@@ -61,9 +61,23 @@ Perfect for:
 
 Not suitable for:
 
-- Long-running sessions
 - Cross-session persistence
-- Token budget management
+- Custom compaction strategies
+
+## Compaction Strategy
+
+The SimpleContextManager compacts automatically when token usage reaches the configured threshold (default: 92% of max_tokens):
+
+- **Keeps**: All system messages + last 10 conversation messages
+- **Deduplicates**: Non-tool messages (based on role and first 100 chars of content)
+- **Preserves tool pairs**: Tool_use and tool_result messages are treated as atomic units
+  - If keeping assistant message with tool_calls, keeps next tool message
+  - If keeping tool message, keeps previous assistant message
+  - Never deduplicates tool-related messages (each has unique ID)
+
+### Tool Pair Preservation
+
+Anthropic API requires that every tool_use in message N has a matching tool_result in message N+1. The context manager preserves these pairs as atomic units during compaction to maintain conversation state integrity and prevent API errors
 
 ## Dependencies
 

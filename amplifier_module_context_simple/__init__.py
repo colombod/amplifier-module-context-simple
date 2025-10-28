@@ -108,26 +108,78 @@ class SimpleContextManager:
         return should
 
     async def compact(self) -> None:
-        """Compact the context to reduce size."""
+        """Compact the context while preserving tool_use/tool_result pairs as atomic units.
+
+        Anthropic API requires that tool_use blocks in message N have matching tool_result
+        blocks in message N+1. These pairs are treated as atomic units during compaction:
+        - If keeping a message with tool_calls, keep the next message (tool_result)
+        - If keeping a tool message, keep the previous message (tool_use)
+
+        This preserves conversation state integrity per IMPLEMENTATION_PHILOSOPHY.md:
+        "Data integrity: Ensure data consistency and reliability"
+        """
         logger.info(f"Compacting context with {len(self.messages)} messages")
 
-        # Keep system messages and last 10 messages
-        system_messages = [m for m in self.messages if m.get("role") == "system"]
-        recent_messages = self.messages[-10:]
+        # Step 1: Determine base keep set
+        keep_indices = set()
 
-        # Combine unique messages
+        # Keep all system messages
+        for i, msg in enumerate(self.messages):
+            if msg.get("role") == "system":
+                keep_indices.add(i)
+
+        # Keep last 10 messages
+        for i in range(max(0, len(self.messages) - 10), len(self.messages)):
+            keep_indices.add(i)
+
+        # Step 2: Expand to preserve tool pairs (atomic units)
+        expanded = keep_indices.copy()
+        for i in keep_indices:
+            msg = self.messages[i]
+
+            # If keeping assistant with tool_calls, MUST keep next message
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                if i + 1 < len(self.messages):
+                    expanded.add(i + 1)
+                    logger.debug(f"Preserving tool pair: message {i} (tool_use) + {i+1} (tool_result)")
+
+            # If keeping tool message, MUST keep previous assistant
+            elif msg.get("role") == "tool" and i > 0:
+                prev_msg = self.messages[i - 1]
+                if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+                    expanded.add(i - 1)
+                    logger.debug(f"Preserving tool pair: message {i-1} (tool_use) + {i} (tool_result)")
+
+        # Step 3: Build ordered compacted list
+        compacted = [self.messages[i] for i in sorted(expanded)]
+
+        # Step 4: Deduplicate (but never deduplicate tool pairs)
         seen = set()
-        compacted = []
+        final = []
 
-        for msg in system_messages + recent_messages:
-            msg_key = (msg.get("role"), msg.get("content", "")[:100])
-            if msg_key not in seen:
-                seen.add(msg_key)
-                compacted.append(msg)
+        for msg in compacted:
+            # Never deduplicate tool-related messages (each is unique by ID)
+            if msg.get("role") == "tool":
+                final.append(msg)
+            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                final.append(msg)
+            else:
+                # Normal deduplication for non-tool messages
+                msg_key = (msg.get("role"), msg.get("content", "")[:100])
+                if msg_key not in seen:
+                    seen.add(msg_key)
+                    final.append(msg)
 
-        self.messages = compacted
+        old_count = len(self.messages)
+        self.messages = final
         self._recalculate_tokens()
-        logger.info(f"Compacted to {len(self.messages)} messages")
+
+        # Log tool pair preservation
+        tool_use_count = sum(1 for m in final if m.get("tool_calls"))
+        tool_result_count = sum(1 for m in final if m.get("role") == "tool")
+        logger.info(
+            f"Compacted {old_count} → {len(final)} messages " f"({tool_use_count} tool pairs preserved)"
+        )
 
     async def set_messages(self, messages: list[dict[str, Any]]) -> None:
         """Set messages from a saved transcript (for session resume)."""
