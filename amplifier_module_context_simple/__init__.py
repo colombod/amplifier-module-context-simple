@@ -137,11 +137,31 @@ class SimpleContextManager:
         for i in keep_indices:
             msg = self.messages[i]
 
-            # If keeping assistant with tool_calls, MUST keep next message
+            # If keeping assistant with tool_calls, MUST keep ALL following tool result messages
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                if i + 1 < len(self.messages):
-                    expanded.add(i + 1)
-                    logger.debug(f"Preserving tool pair: message {i} (tool_use) + {i + 1} (tool_result)")
+                num_tool_calls = len(msg["tool_calls"])
+                # Keep the next N tool result messages (where N = number of tool_calls)
+                # Verify they're actually tool messages to be safe
+                tool_results_kept = 0
+                offset = 1
+                while tool_results_kept < num_tool_calls and i + offset < len(self.messages):
+                    next_msg = self.messages[i + offset]
+                    if next_msg.get("role") == "tool":
+                        expanded.add(i + offset)
+                        tool_results_kept += 1
+                    else:
+                        # Non-tool message found before all results collected - possible corruption
+                        logger.warning(
+                            f"Message {i} has {num_tool_calls} tool_calls but only {tool_results_kept} "
+                            f"tool results found before non-tool message at {i + offset}"
+                        )
+                        break
+                    offset += 1
+
+                logger.debug(
+                    f"Preserving tool group: message {i} (assistant with {num_tool_calls} tool_calls) "
+                    f"+ next {tool_results_kept} tool result messages"
+                )
 
             # If keeping tool message, MUST keep previous assistant
             elif msg.get("role") == "tool" and i > 0:
