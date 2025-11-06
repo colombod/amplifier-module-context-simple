@@ -204,9 +204,7 @@ class SimpleContextManager:
                 # Verify they're actually tool messages to be safe
                 tool_results_kept = 0
                 offset = 1
-                while tool_results_kept < num_tool_calls and i + offset < len(
-                    self.messages
-                ):
+                while tool_results_kept < num_tool_calls and i + offset < len(self.messages):
                     next_msg = self.messages[i + offset]
                     if next_msg.get("role") == "tool":
                         expanded.add(i + offset)
@@ -230,9 +228,7 @@ class SimpleContextManager:
                 prev_msg = self.messages[i - 1]
                 if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
                     expanded.add(i - 1)
-                    logger.debug(
-                        f"Preserving tool pair: message {i - 1} (tool_use) + {i} (tool_result)"
-                    )
+                    logger.debug(f"Preserving tool pair: message {i - 1} (tool_use) + {i} (tool_result)")
 
         # Step 3: Build ordered compacted list
         compacted = [self.messages[i] for i in sorted(expanded)]
@@ -243,11 +239,7 @@ class SimpleContextManager:
 
         for msg in compacted:
             # Never deduplicate tool-related messages (each is unique by ID)
-            if (
-                msg.get("role") == "tool"
-                or msg.get("role") == "assistant"
-                and msg.get("tool_calls")
-            ):
+            if msg.get("role") == "tool" or msg.get("role") == "assistant" and msg.get("tool_calls"):
                 final.append(msg)
             else:
                 # Normal deduplication for non-tool messages
@@ -308,11 +300,7 @@ class SimpleContextManager:
                 if status:
                     lines = [line for line in status.split("\n") if line.strip()]
                     modified = [line for line in lines if line.startswith(" M")]
-                    added = [
-                        line
-                        for line in lines
-                        if line.startswith("A ") or line.startswith("??")
-                    ]
+                    added = [line for line in lines if line.startswith("A ") or line.startswith("??")]
                     deleted = [line for line in lines if line.startswith(" D")]
 
                     parts.append("**Working directory:**\n")
@@ -328,9 +316,7 @@ class SimpleContextManager:
 
             # Recent commits
             if self.git_include_commits and self.git_include_commits > 0:
-                log = self._run_git(
-                    ["log", "--oneline", f"-{self.git_include_commits}"]
-                )
+                log = self._run_git(["log", "--oneline", f"-{self.git_include_commits}"])
                 if log:
                     parts.append(f"**Recent commits:**\n```\n{log}\n```\n\n")
 
@@ -339,9 +325,7 @@ class SimpleContextManager:
                 for main_branch in ["main", "master"]:
                     result = self._run_git(["rev-parse", "--verify", main_branch])
                     if result is not None:
-                        parts.append(
-                            f"**Main branch:** `{main_branch}` (use for PRs)\n\n"
-                        )
+                        parts.append(f"**Main branch:** `{main_branch}` (use for PRs)\n\n")
                         break
 
             parts.append("---\n")
