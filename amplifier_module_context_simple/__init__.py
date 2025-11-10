@@ -169,12 +169,27 @@ class SimpleContextManager:
                     f"+ next {tool_results_kept} tool result messages"
                 )
 
-            # If keeping tool message, MUST keep previous assistant
-            elif msg.get("role") == "tool" and i > 0:
-                prev_msg = self.messages[i - 1]
-                if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
-                    expanded.add(i - 1)
-                    logger.debug(f"Preserving tool pair: message {i - 1} (tool_use) + {i} (tool_result)")
+            # If keeping tool message, MUST keep the assistant with tool_calls
+            # Walk backwards to find it (may be multiple tool results after one assistant)
+            elif msg.get("role") == "tool":
+                # Find the assistant message with tool_calls that this result belongs to
+                for j in range(i - 1, -1, -1):
+                    check_msg = self.messages[j]
+                    if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
+                        expanded.add(j)
+                        logger.debug(
+                            f"Preserving tool group: message {j} (assistant with tool_calls) "
+                            f"includes tool result at {i}"
+                        )
+                        break
+                    if check_msg.get("role") != "tool":
+                        # Hit a non-tool, non-assistant-with-tool_calls message before finding the assistant
+                        # This shouldn't happen in well-formed conversation but log if it does
+                        logger.warning(
+                            f"Tool result at {i} has no matching assistant with tool_calls "
+                            f"(found {check_msg.get('role')} at {j} instead)"
+                        )
+                        break
 
         # Step 3: Build ordered compacted list
         compacted = [self.messages[i] for i in sorted(expanded)]
