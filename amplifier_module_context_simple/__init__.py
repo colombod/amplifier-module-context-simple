@@ -3,6 +3,9 @@ Simple context manager module.
 Basic message list with token counting and compaction.
 """
 
+# Amplifier module metadata
+__amplifier_module_type__ = "context"
+
 import logging
 from typing import Any
 
