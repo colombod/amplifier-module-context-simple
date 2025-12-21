@@ -146,30 +146,39 @@ class SimpleContextManager:
         for i in keep_indices:
             msg = self.messages[i]
 
-            # If keeping assistant with tool_calls, MUST keep ALL following tool result messages
+            # If keeping assistant with tool_calls, MUST keep ALL matching tool result messages
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                num_tool_calls = len(msg["tool_calls"])
-                # Keep the next N tool result messages (where N = number of tool_calls)
-                # Verify they're actually tool messages to be safe
+                # Collect the tool_call IDs we need to find results for
+                expected_tool_ids = set()
+                for tc in msg["tool_calls"]:
+                    if tc:
+                        tool_id = tc.get("id") or tc.get("tool_call_id")
+                        if tool_id:
+                            expected_tool_ids.add(tool_id)
+
+                # Scan forward to find matching tool results (may not be immediately adjacent
+                # due to hook-injected context messages between assistant and tool results)
                 tool_results_kept = 0
-                offset = 1
-                while tool_results_kept < num_tool_calls and i + offset < len(self.messages):
-                    next_msg = self.messages[i + offset]
-                    if next_msg.get("role") == "tool":
-                        expanded.add(i + offset)
-                        tool_results_kept += 1
-                    else:
-                        # Non-tool message found before all results collected - possible corruption
-                        logger.warning(
-                            f"Message {i} has {num_tool_calls} tool_calls but only {tool_results_kept} "
-                            f"tool results found before non-tool message at {i + offset}"
-                        )
-                        break
-                    offset += 1
+                for j in range(i + 1, len(self.messages)):
+                    candidate = self.messages[j]
+                    if candidate.get("role") == "tool":
+                        tool_id = candidate.get("tool_call_id")
+                        if tool_id in expected_tool_ids:
+                            expanded.add(j)
+                            expected_tool_ids.discard(tool_id)
+                            tool_results_kept += 1
+                            if not expected_tool_ids:
+                                break  # Found all tool results
+
+                if expected_tool_ids:
+                    logger.warning(
+                        f"Message {i} has {len(msg['tool_calls'])} tool_calls but only "
+                        f"{tool_results_kept} matching tool results found (missing IDs: {expected_tool_ids})"
+                    )
 
                 logger.debug(
-                    f"Preserving tool group: message {i} (assistant with {num_tool_calls} tool_calls) "
-                    f"+ next {tool_results_kept} tool result messages"
+                    f"Preserving tool group: message {i} (assistant with {len(msg['tool_calls'])} tool_calls) "
+                    f"+ {tool_results_kept} tool result messages"
                 )
 
             # If keeping tool message, MUST keep the assistant with tool_calls
