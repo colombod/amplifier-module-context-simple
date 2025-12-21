@@ -62,40 +62,32 @@ class SimpleContextManager:
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
 
+        Note: This method does NOT auto-compact. Compaction is handled by the
+        orchestrator at strategic points (after tool batches complete, before
+        LLM requests) to avoid compacting mid-tool-execution.
+
         Raises:
-            RuntimeError: If adding message would exceed max_tokens after compaction
+            RuntimeError: If adding message would exceed max_tokens
         """
         # Estimate tokens for this message
         message_tokens = len(str(message)) // 4
 
-        # Check if adding this message would exceed threshold
+        # Check if adding this message would exceed hard limit
         projected_total = self._token_count + message_tokens
-        usage = projected_total / self.max_tokens
 
-        if usage >= self.compact_threshold:
-            logger.info(
-                f"Projected usage {usage:.1%} >= threshold {self.compact_threshold:.1%}, "
-                f"compacting before adding message"
+        if projected_total > self.max_tokens:
+            error_msg = (
+                f"Cannot add message: would exceed context limit "
+                f"({projected_total:,} tokens > {self.max_tokens:,} max). "
+                f"Current context: {self._token_count:,} tokens, "
+                f"message: {message_tokens:,} tokens. "
+                f"Suggestions: reduce memory files, use shorter messages, "
+                f"or increase max_tokens in context config."
             )
-            await self.compact()
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
-            # Re-check after compaction
-            projected_total = self._token_count + message_tokens
-
-            # If still would exceed max_tokens, reject
-            if projected_total > self.max_tokens:
-                error_msg = (
-                    f"Cannot add message: would exceed context limit "
-                    f"({projected_total:,} tokens > {self.max_tokens:,} max). "
-                    f"Current context: {self._token_count:,} tokens, "
-                    f"message: {message_tokens:,} tokens. "
-                    f"Suggestions: reduce memory files, use shorter messages, "
-                    f"or increase max_tokens in context config."
-                )
-                logger.error(error_msg)
-                raise RuntimeError(error_msg)
-
-        # Add message if we have room
+        # Add message
         self.messages.append(message)
         self._token_count += message_tokens
         logger.debug(
