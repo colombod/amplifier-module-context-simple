@@ -62,38 +62,33 @@ class SimpleContextManager:
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
 
-        Note: This method does NOT auto-compact. Compaction is handled by the
-        orchestrator at strategic points (after tool batches complete, before
-        LLM requests) to avoid compacting mid-tool-execution.
+        Note: This method always accepts messages without hard limits.
+        Compaction is handled by the orchestrator at strategic points
+        (before LLM requests) to keep context within bounds.
 
-        Raises:
-            RuntimeError: If adding message would exceed max_tokens
+        Tool results MUST be added even if over threshold, otherwise
+        tool_use/tool_result pairing breaks. The orchestrator will
+        compact before the next LLM request.
         """
         # Estimate tokens for this message
         message_tokens = len(str(message)) // 4
 
-        # Check if adding this message would exceed hard limit
-        projected_total = self._token_count + message_tokens
-
-        if projected_total > self.max_tokens:
-            error_msg = (
-                f"Cannot add message: would exceed context limit "
-                f"({projected_total:,} tokens > {self.max_tokens:,} max). "
-                f"Current context: {self._token_count:,} tokens, "
-                f"message: {message_tokens:,} tokens. "
-                f"Suggestions: reduce memory files, use shorter messages, "
-                f"or increase max_tokens in context config."
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        # Add message
+        # Add message (no rejection - compaction happens at orchestrator level)
         self.messages.append(message)
         self._token_count += message_tokens
+
+        # Warn if significantly over threshold (but don't reject)
+        usage = self._token_count / self.max_tokens
+        if usage > 1.0:
+            logger.warning(
+                f"Context at {usage:.1%} of max ({self._token_count:,}/{self.max_tokens:,} tokens). "
+                f"Compaction will run before next LLM request."
+            )
+
         logger.debug(
             f"Added message: {message.get('role', 'unknown')} - "
             f"{len(self.messages)} total messages, {self._token_count:,} tokens "
-            f"({self._token_count / self.max_tokens:.1%})"
+            f"({usage:.1%})"
         )
 
     async def get_messages(self) -> list[dict[str, Any]]:
