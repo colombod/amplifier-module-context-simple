@@ -216,7 +216,10 @@ class SimpleContextManager:
                 final.append(msg)
             else:
                 # Normal deduplication for non-tool messages
-                msg_key = (msg.get("role"), msg.get("content", "")[:100])
+                # Content may be a string or list of blocks - convert to string for hashing
+                content = msg.get("content", "")
+                content_str = str(content) if not isinstance(content, str) else content
+                msg_key = (msg.get("role"), content_str[:100])
                 if msg_key not in seen:
                     seen.add(msg_key)
                     final.append(msg)
