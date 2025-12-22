@@ -123,9 +123,18 @@ async def test_compact_preserves_tool_pairs_scenario_b():
 
 @pytest.mark.asyncio
 async def test_compact_never_deduplicates_tool_messages():
-    """Tool messages are never deduplicated since each has unique tool_call_id."""
-    # Use low max_tokens to force compaction
-    context = SimpleContextManager(max_tokens=100, compact_threshold=0.5)
+    """Tool messages are never deduplicated since each has unique tool_call_id.
+
+    With progressive compaction, older tool pairs may be removed entirely (as atomic units).
+    This test verifies that tool pairs with identical content are NOT deduplicated -
+    if multiple pairs exist, they remain separate (not merged into one).
+    """
+    # Use protected_recent=0.8 to keep both tool pairs in protected zone
+    context = SimpleContextManager(
+        max_tokens=100,
+        compact_threshold=0.5,
+        protected_recent=0.8,  # Protect 80% of messages to keep both tool pairs
+    )
 
     # Add tool pair twice with same content but different IDs
     await context.add_message({"role": "user", "content": "test"})
@@ -204,9 +213,16 @@ async def test_compact_with_multiple_tool_calls_in_one_message():
     all 6 tool result messages must be preserved during compaction.
 
     Regression test for: "Message 7 has tool_use IDs without matching tool_result blocks"
+
+    With progressive compaction, we use protected_recent to keep the tool pair in the
+    protected zone, ensuring the assistant + all 6 tool results are preserved together.
     """
-    # Use low max_tokens to force compaction
-    context = SimpleContextManager(max_tokens=200, compact_threshold=0.5)
+    # Use protected_recent=0.5 to keep the multi-tool-call pair in protected zone
+    context = SimpleContextManager(
+        max_tokens=200,
+        compact_threshold=0.5,
+        protected_recent=0.5,  # Protect last 50% to include the tool pair
+    )
 
     # Add conversation to fill context
     for i in range(8):

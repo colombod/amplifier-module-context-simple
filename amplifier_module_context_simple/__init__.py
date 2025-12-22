@@ -22,7 +22,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         coordinator: Module coordinator
         config: Optional configuration
             - max_tokens: Maximum context size (default: 200,000)
-            - compact_threshold: Compaction threshold (default: 0.92)
+            - compact_threshold: Trigger compaction at this usage (default: 0.92)
+            - target_usage: Compact down to this usage (default: 0.50)
+            - truncate_boundary: Truncate tool results in first N% of history (default: 0.50)
+            - protected_recent: Always protect last N% of messages (default: 0.10)
+            - truncate_chars: Characters to keep when truncating tool results (default: 250)
 
     Returns:
         Optional cleanup function
@@ -31,6 +35,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     context = SimpleContextManager(
         max_tokens=config.get("max_tokens", 200_000),
         compact_threshold=config.get("compact_threshold", 0.92),
+        target_usage=config.get("target_usage", 0.50),
+        truncate_boundary=config.get("truncate_boundary", 0.50),
+        protected_recent=config.get("protected_recent", 0.10),
+        truncate_chars=config.get("truncate_chars", 250),
     )
     await coordinator.mount("context", context)
     logger.info("Mounted SimpleContextManager")
@@ -44,23 +52,41 @@ class SimpleContextManager:
     Owns memory policy: orchestrators ask for messages via get_messages_for_request(),
     and this context manager decides how to fit them within limits. Compaction is
     handled internally - orchestrators don't know or care about compaction.
+
+    Compaction Strategy (Progressive Percentage-Based):
+    1. Trigger when usage >= compact_threshold (default 92%)
+    2. Phase 1: Truncate old tool results in first truncate_boundary% of history
+    3. Phase 2: Remove oldest messages until at target_usage% (default 50%)
+    4. Always protect: system messages, last protected_recent% of messages, tool pairs
     """
 
     def __init__(
         self,
         max_tokens: int = 200_000,
         compact_threshold: float = 0.92,
+        target_usage: float = 0.50,
+        truncate_boundary: float = 0.50,
+        protected_recent: float = 0.10,
+        truncate_chars: int = 250,
     ):
         """
         Initialize the context manager.
 
         Args:
             max_tokens: Maximum context size in tokens
-            compact_threshold: Threshold for triggering compaction (0.0-1.0)
+            compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
+            target_usage: Compact down to this usage ratio (0.0-1.0)
+            truncate_boundary: Truncate tool results in first N% of history (0.0-1.0)
+            protected_recent: Always protect last N% of messages (0.0-1.0)
+            truncate_chars: Characters to keep when truncating tool results
         """
         self.messages: list[dict[str, Any]] = []
         self.max_tokens = max_tokens
         self.compact_threshold = compact_threshold
+        self.target_usage = target_usage
+        self.truncate_boundary = truncate_boundary
+        self.protected_recent = protected_recent
+        self.truncate_chars = truncate_chars
         self._token_count = 0
 
     async def add_message(self, message: dict[str, Any]) -> None:
@@ -140,135 +166,149 @@ class SimpleContextManager:
         return should
 
     async def _compact_internal(self) -> None:
-        """Internal: Compact the context while preserving tool_use/tool_result pairs.
+        """Internal: Compact the context using progressive percentage-based strategy.
+
+        Two-phase approach:
+        1. Truncate old tool results (cheap, preserves conversation flow)
+        2. Remove oldest messages if still over target (preserves tool pairs)
 
         Anthropic API requires that tool_use blocks in message N have matching tool_result
-        blocks in message N+1. These pairs are treated as atomic units during compaction:
-        - If keeping a message with tool_calls, keep the next message (tool_result)
-        - If keeping a tool message, keep the previous message (tool_use)
+        blocks in message N+1. These pairs are treated as atomic units during compaction.
 
         This preserves conversation state integrity per IMPLEMENTATION_PHILOSOPHY.md:
         "Data integrity: Ensure data consistency and reliability"
         """
-        logger.info(f"Compacting context with {len(self.messages)} messages")
+        budget = self._calculate_budget(None, None)
+        target_tokens = int(budget * self.target_usage)
+        old_count = len(self.messages)
+        old_tokens = self._token_count
 
-        # Step 1: Determine base keep set
-        keep_indices = set()
+        logger.info(
+            f"Compacting context: {len(self.messages)} messages, {self._token_count:,} tokens "
+            f"(target: {target_tokens:,} tokens, {self.target_usage:.0%} of {budget:,})"
+        )
 
-        # Keep all system messages
-        for i, msg in enumerate(self.messages):
-            if msg.get("role") == "system":
-                keep_indices.add(i)
+        # Phase 1: Truncate old tool results
+        truncate_boundary_idx = int(len(self.messages) * self.truncate_boundary)
+        truncated_count = 0
 
-        # Keep last 10 messages
-        for i in range(max(0, len(self.messages) - 10), len(self.messages)):
-            keep_indices.add(i)
+        for i in range(truncate_boundary_idx):
+            msg = self.messages[i]
+            if msg.get("role") == "tool" and not msg.get("_truncated"):
+                self._truncate_tool_result(msg)
+                truncated_count += 1
 
-        # Step 2: Expand to preserve tool pairs (atomic units)
-        # IMPORTANT: Must iterate until no new messages added, because:
-        # - If tool_result in keep_indices → adds tool_use to expanded
-        # - That tool_use → must add ALL its tool_results (not just those in keep_indices)
-        expanded = keep_indices.copy()
-        processed_indices = set()
+        self._recalculate_tokens()
+        logger.info(
+            f"Phase 1: Truncated {truncated_count} tool results in first {self.truncate_boundary:.0%} of history. "
+            f"Tokens: {old_tokens:,} → {self._token_count:,}"
+        )
 
-        changed = True
-        while changed:
-            changed = False
-            # Process indices we haven't processed yet
-            to_process = expanded - processed_indices
-            for i in to_process:
-                processed_indices.add(i)
+        # Phase 2: If still over target, remove oldest messages
+        if self._token_count > target_tokens:
+            # Determine protected indices
+            protected_indices = set()
+
+            # Always protect system messages
+            for i, msg in enumerate(self.messages):
+                if msg.get("role") == "system":
+                    protected_indices.add(i)
+
+            # Always protect last N% of messages
+            protected_boundary = int(len(self.messages) * (1 - self.protected_recent))
+            for i in range(protected_boundary, len(self.messages)):
+                protected_indices.add(i)
+
+            # Build removal candidates (oldest first, excluding protected)
+            removal_candidates = []
+            for i, msg in enumerate(self.messages):
+                if i not in protected_indices:
+                    removal_candidates.append(i)
+
+            # Remove messages until under target, preserving tool pairs
+            indices_to_remove = set()
+            for i in removal_candidates:
+                if self._token_count <= target_tokens:
+                    break
+
                 msg = self.messages[i]
 
-                # If keeping assistant with tool_calls, MUST keep ALL matching tool results
-                if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    # Collect the tool_call IDs we need to find results for
-                    expected_tool_ids = set()
-                    for tc in msg["tool_calls"]:
-                        if tc:
-                            tool_id = tc.get("id") or tc.get("tool_call_id")
-                            if tool_id:
-                                expected_tool_ids.add(tool_id)
-
-                    # Scan forward to find matching tool results
-                    tool_results_kept = 0
-                    for j in range(i + 1, len(self.messages)):
-                        candidate = self.messages[j]
-                        if candidate.get("role") == "tool":
-                            tool_id = candidate.get("tool_call_id")
-                            if tool_id in expected_tool_ids:
-                                if j not in expanded:
-                                    expanded.add(j)
-                                    changed = True
-                                expected_tool_ids.discard(tool_id)
-                                tool_results_kept += 1
-                                if not expected_tool_ids:
-                                    break  # Found all tool results
-
-                    if expected_tool_ids:
-                        logger.warning(
-                            f"Message {i} has {len(msg['tool_calls'])} tool_calls but only "
-                            f"{tool_results_kept} matching tool results found (missing IDs: {expected_tool_ids})"
-                        )
-
-                    logger.debug(
-                        f"Preserving tool group: message {i} (assistant with {len(msg['tool_calls'])} tool_calls) "
-                        f"+ {tool_results_kept} tool result messages"
-                    )
-
-                # If keeping tool message, MUST keep the assistant with tool_calls
-                elif msg.get("role") == "tool":
-                    # Walk backwards to find assistant with tool_calls
+                # If this is a tool result, also mark its tool_use for removal
+                if msg.get("role") == "tool":
+                    # Find the assistant with tool_calls
                     for j in range(i - 1, -1, -1):
                         check_msg = self.messages[j]
                         if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
-                            if j not in expanded:
-                                expanded.add(j)
-                                changed = True
-                            logger.debug(
-                                f"Preserving tool group: message {j} (assistant with tool_calls) "
-                                f"includes tool result at {i}"
-                            )
+                            if j not in protected_indices:
+                                indices_to_remove.add(j)
+                                # Also remove ALL tool results for this tool_use
+                                for tc in check_msg.get("tool_calls", []):
+                                    tc_id = tc.get("id") or tc.get("tool_call_id")
+                                    if tc_id:
+                                        for k, m in enumerate(self.messages):
+                                            if m.get("tool_call_id") == tc_id and k not in protected_indices:
+                                                indices_to_remove.add(k)
                             break
                         if check_msg.get("role") != "tool":
-                            logger.warning(
-                                f"Tool result at {i} has no matching assistant with tool_calls "
-                                f"(found {check_msg.get('role')} at {j} instead)"
-                            )
                             break
 
-        # Step 3: Build ordered compacted list
-        compacted = [self.messages[i] for i in sorted(expanded)]
+                # If this is an assistant with tool_calls, also remove all its tool results
+                elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    indices_to_remove.add(i)
+                    for tc in msg.get("tool_calls", []):
+                        tc_id = tc.get("id") or tc.get("tool_call_id")
+                        if tc_id:
+                            for k, m in enumerate(self.messages):
+                                if m.get("tool_call_id") == tc_id and k not in protected_indices:
+                                    indices_to_remove.add(k)
 
-        # Step 4: Deduplicate (but never deduplicate tool pairs)
-        seen = set()
-        final = []
+                # Regular message - just remove it
+                else:
+                    indices_to_remove.add(i)
 
-        for msg in compacted:
-            # Never deduplicate tool-related messages (each is unique by ID)
-            if msg.get("role") == "tool" or msg.get("role") == "assistant" and msg.get("tool_calls"):
-                final.append(msg)
-            else:
-                # Normal deduplication for non-tool messages
-                # Content may be a string or list of blocks - convert to string for hashing
-                content = msg.get("content", "")
-                content_str = str(content) if not isinstance(content, str) else content
-                msg_key = (msg.get("role"), content_str[:100])
-                if msg_key not in seen:
-                    seen.add(msg_key)
-                    final.append(msg)
+                # Estimate token reduction
+                removed_tokens = sum(
+                    len(str(self.messages[idx])) // 4 for idx in indices_to_remove if idx not in protected_indices
+                )
+                if self._token_count - removed_tokens <= target_tokens:
+                    break
 
-        old_count = len(self.messages)
-        self.messages = final
-        self._recalculate_tokens()
+            # Build final message list excluding removed indices
+            self.messages = [msg for i, msg in enumerate(self.messages) if i not in indices_to_remove]
+            self._recalculate_tokens()
 
-        # Log tool pair preservation
-        tool_use_count = sum(1 for m in final if m.get("tool_calls"))
-        tool_result_count = sum(1 for m in final if m.get("role") == "tool")
+            logger.info(
+                f"Phase 2: Removed {len(indices_to_remove)} messages. Tokens: {old_tokens:,} → {self._token_count:,}"
+            )
+
+        # Log final state
+        tool_use_count = sum(1 for m in self.messages if m.get("tool_calls"))
+        tool_result_count = sum(1 for m in self.messages if m.get("role") == "tool")
         logger.info(
-            f"Compacted {old_count} → {len(final)} messages "
+            f"Compaction complete: {old_count} → {len(self.messages)} messages, "
+            f"{old_tokens:,} → {self._token_count:,} tokens "
             f"({tool_use_count} tool_use, {tool_result_count} tool_result pairs preserved)"
         )
+
+    def _truncate_tool_result(self, msg: dict[str, Any]) -> None:
+        """Truncate a tool result message to reduce token count.
+
+        Preserves tool_call_id and structure, replaces content with truncated version.
+        """
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > self.truncate_chars:
+            original_tokens = len(content) // 4
+            truncated_content = content[: self.truncate_chars]
+
+            # Add truncation marker with metadata
+            msg["content"] = f"[truncated: ~{original_tokens:,} tokens] {truncated_content}..."
+            msg["_truncated"] = True
+            msg["_original_tokens"] = original_tokens
+
+            logger.debug(
+                f"Truncated tool result {msg.get('tool_call_id', 'unknown')}: "
+                f"{original_tokens:,} → ~{len(msg['content']) // 4} tokens"
+            )
 
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
         """Calculate effective token budget from provider or fallback to config.
