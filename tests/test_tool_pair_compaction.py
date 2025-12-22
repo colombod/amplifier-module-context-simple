@@ -3,6 +3,9 @@ Tests for tool pair preservation during context compaction.
 
 Verifies that tool_use and tool_result messages are kept as atomic pairs
 during compaction, preventing Anthropic API errors.
+
+NOTE: Compaction is triggered via get_messages_for_request() when context
+exceeds the compact_threshold. Tests use low max_tokens to force compaction.
 """
 
 import pytest
@@ -21,7 +24,8 @@ async def test_compact_preserves_tool_pairs_scenario_a():
     Without fix: Keeps message 9, drops message 10 → API error
     With fix: Keeps both 9 and 10 (tool pair preserved)
     """
-    context = SimpleContextManager()
+    # Use low max_tokens to force compaction
+    context = SimpleContextManager(max_tokens=100, compact_threshold=0.5)
 
     # Add 9 regular messages
     for i in range(9):
@@ -40,10 +44,8 @@ async def test_compact_preserves_tool_pairs_scenario_a():
     # Verify we have 11 messages
     assert len(context.messages) == 11
 
-    # Compact (should keep last 10 = indices 1-10, but will expand to include message 9 partner)
-    await context.compact()
-
-    messages = await context.get_messages()
+    # Trigger compaction via get_messages_for_request()
+    messages = await context.get_messages_for_request()
 
     # Verify tool pair preserved
     has_tool_use = any(m.get("role") == "assistant" and m.get("tool_calls") for m in messages)
@@ -76,7 +78,8 @@ async def test_compact_preserves_tool_pairs_scenario_b():
     Without fix: Keeps message 9, drops message 8 → API error
     With fix: Keeps both 8 and 9 (tool pair preserved)
     """
-    context = SimpleContextManager()
+    # Use low max_tokens to force compaction
+    context = SimpleContextManager(max_tokens=100, compact_threshold=0.5)
 
     # Add 8 regular messages
     for i in range(8):
@@ -99,10 +102,8 @@ async def test_compact_preserves_tool_pairs_scenario_b():
     # Verify we have 12 messages
     assert len(context.messages) == 12
 
-    # Compact (should keep last 10 = indices 2-11, but will expand to include message 8)
-    await context.compact()
-
-    messages = await context.get_messages()
+    # Trigger compaction via get_messages_for_request()
+    messages = await context.get_messages_for_request()
 
     # Verify tool pair preserved
     tool_use_count = sum(1 for m in messages if m.get("role") == "assistant" and m.get("tool_calls"))
@@ -123,7 +124,8 @@ async def test_compact_preserves_tool_pairs_scenario_b():
 @pytest.mark.asyncio
 async def test_compact_never_deduplicates_tool_messages():
     """Tool messages are never deduplicated since each has unique tool_call_id."""
-    context = SimpleContextManager()
+    # Use low max_tokens to force compaction
+    context = SimpleContextManager(max_tokens=100, compact_threshold=0.5)
 
     # Add tool pair twice with same content but different IDs
     await context.add_message({"role": "user", "content": "test"})
@@ -148,10 +150,8 @@ async def test_compact_never_deduplicates_tool_messages():
     )
     await context.add_message({"role": "tool", "tool_call_id": "toolu_2", "content": "file1.txt"})
 
-    # Compact
-    await context.compact()
-
-    messages = await context.get_messages()
+    # Trigger compaction via get_messages_for_request()
+    messages = await context.get_messages_for_request()
 
     # Both tool pairs should be preserved (not deduplicated despite same content)
     tool_result_count = sum(1 for m in messages if m.get("role") == "tool")
@@ -161,7 +161,8 @@ async def test_compact_never_deduplicates_tool_messages():
 @pytest.mark.asyncio
 async def test_compact_with_multiple_tool_pairs():
     """Multiple tool pairs are all preserved correctly."""
-    context = SimpleContextManager()
+    # Use low max_tokens to force compaction
+    context = SimpleContextManager(max_tokens=100, compact_threshold=0.5)
 
     # Add 3 tool pairs
     for i in range(3):
@@ -179,10 +180,8 @@ async def test_compact_with_multiple_tool_pairs():
     for i in range(10):
         await context.add_message({"role": "user", "content": f"later message {i}"})
 
-    # Compact
-    await context.compact()
-
-    messages = await context.get_messages()
+    # Trigger compaction via get_messages_for_request()
+    messages = await context.get_messages_for_request()
 
     # Verify all remaining tool pairs are complete
     for i, msg in enumerate(messages):
@@ -206,7 +205,8 @@ async def test_compact_with_multiple_tool_calls_in_one_message():
 
     Regression test for: "Message 7 has tool_use IDs without matching tool_result blocks"
     """
-    context = SimpleContextManager()
+    # Use low max_tokens to force compaction
+    context = SimpleContextManager(max_tokens=200, compact_threshold=0.5)
 
     # Add conversation to fill context
     for i in range(8):
@@ -240,10 +240,8 @@ async def test_compact_with_multiple_tool_calls_in_one_message():
     # Add more messages
     await context.add_message({"role": "user", "content": "what did you find?"})
 
-    # Compact (should keep last 10 messages + the assistant with tool_calls + all 6 results)
-    await context.compact()
-
-    messages = await context.get_messages()
+    # Trigger compaction via get_messages_for_request()
+    messages = await context.get_messages_for_request()
 
     # Find the assistant message with 6 tool_calls
     assistant_idx = None

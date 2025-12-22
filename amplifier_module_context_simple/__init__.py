@@ -166,66 +166,77 @@ class SimpleContextManager:
             keep_indices.add(i)
 
         # Step 2: Expand to preserve tool pairs (atomic units)
+        # IMPORTANT: Must iterate until no new messages added, because:
+        # - If tool_result in keep_indices → adds tool_use to expanded
+        # - That tool_use → must add ALL its tool_results (not just those in keep_indices)
         expanded = keep_indices.copy()
-        for i in keep_indices:
-            msg = self.messages[i]
+        processed_indices = set()
 
-            # If keeping assistant with tool_calls, MUST keep ALL matching tool result messages
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                # Collect the tool_call IDs we need to find results for
-                expected_tool_ids = set()
-                for tc in msg["tool_calls"]:
-                    if tc:
-                        tool_id = tc.get("id") or tc.get("tool_call_id")
-                        if tool_id:
-                            expected_tool_ids.add(tool_id)
+        changed = True
+        while changed:
+            changed = False
+            # Process indices we haven't processed yet
+            to_process = expanded - processed_indices
+            for i in to_process:
+                processed_indices.add(i)
+                msg = self.messages[i]
 
-                # Scan forward to find matching tool results (may not be immediately adjacent
-                # due to hook-injected context messages between assistant and tool results)
-                tool_results_kept = 0
-                for j in range(i + 1, len(self.messages)):
-                    candidate = self.messages[j]
-                    if candidate.get("role") == "tool":
-                        tool_id = candidate.get("tool_call_id")
-                        if tool_id in expected_tool_ids:
-                            expanded.add(j)
-                            expected_tool_ids.discard(tool_id)
-                            tool_results_kept += 1
-                            if not expected_tool_ids:
-                                break  # Found all tool results
+                # If keeping assistant with tool_calls, MUST keep ALL matching tool results
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    # Collect the tool_call IDs we need to find results for
+                    expected_tool_ids = set()
+                    for tc in msg["tool_calls"]:
+                        if tc:
+                            tool_id = tc.get("id") or tc.get("tool_call_id")
+                            if tool_id:
+                                expected_tool_ids.add(tool_id)
 
-                if expected_tool_ids:
-                    logger.warning(
-                        f"Message {i} has {len(msg['tool_calls'])} tool_calls but only "
-                        f"{tool_results_kept} matching tool results found (missing IDs: {expected_tool_ids})"
+                    # Scan forward to find matching tool results
+                    tool_results_kept = 0
+                    for j in range(i + 1, len(self.messages)):
+                        candidate = self.messages[j]
+                        if candidate.get("role") == "tool":
+                            tool_id = candidate.get("tool_call_id")
+                            if tool_id in expected_tool_ids:
+                                if j not in expanded:
+                                    expanded.add(j)
+                                    changed = True
+                                expected_tool_ids.discard(tool_id)
+                                tool_results_kept += 1
+                                if not expected_tool_ids:
+                                    break  # Found all tool results
+
+                    if expected_tool_ids:
+                        logger.warning(
+                            f"Message {i} has {len(msg['tool_calls'])} tool_calls but only "
+                            f"{tool_results_kept} matching tool results found (missing IDs: {expected_tool_ids})"
+                        )
+
+                    logger.debug(
+                        f"Preserving tool group: message {i} (assistant with {len(msg['tool_calls'])} tool_calls) "
+                        f"+ {tool_results_kept} tool result messages"
                     )
 
-                logger.debug(
-                    f"Preserving tool group: message {i} (assistant with {len(msg['tool_calls'])} tool_calls) "
-                    f"+ {tool_results_kept} tool result messages"
-                )
-
-            # If keeping tool message, MUST keep the assistant with tool_calls
-            # Walk backwards to find it (may be multiple tool results after one assistant)
-            elif msg.get("role") == "tool":
-                # Find the assistant message with tool_calls that this result belongs to
-                for j in range(i - 1, -1, -1):
-                    check_msg = self.messages[j]
-                    if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
-                        expanded.add(j)
-                        logger.debug(
-                            f"Preserving tool group: message {j} (assistant with tool_calls) "
-                            f"includes tool result at {i}"
-                        )
-                        break
-                    if check_msg.get("role") != "tool":
-                        # Hit a non-tool, non-assistant-with-tool_calls message before finding the assistant
-                        # This shouldn't happen in well-formed conversation but log if it does
-                        logger.warning(
-                            f"Tool result at {i} has no matching assistant with tool_calls "
-                            f"(found {check_msg.get('role')} at {j} instead)"
-                        )
-                        break
+                # If keeping tool message, MUST keep the assistant with tool_calls
+                elif msg.get("role") == "tool":
+                    # Walk backwards to find assistant with tool_calls
+                    for j in range(i - 1, -1, -1):
+                        check_msg = self.messages[j]
+                        if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
+                            if j not in expanded:
+                                expanded.add(j)
+                                changed = True
+                            logger.debug(
+                                f"Preserving tool group: message {j} (assistant with tool_calls) "
+                                f"includes tool result at {i}"
+                            )
+                            break
+                        if check_msg.get("role") != "tool":
+                            logger.warning(
+                                f"Tool result at {i} has no matching assistant with tool_calls "
+                                f"(found {check_msg.get('role')} at {j} instead)"
+                            )
+                            break
 
         # Step 3: Build ordered compacted list
         compacted = [self.messages[i] for i in sorted(expanded)]
