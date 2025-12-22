@@ -1,6 +1,6 @@
 """
 Simple context manager module.
-Basic message list with token counting and compaction.
+Basic message list with token counting and internal compaction.
 """
 
 # Amplifier module metadata
@@ -40,6 +40,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 class SimpleContextManager:
     """
     Basic context manager with message storage and token counting.
+
+    Owns memory policy: orchestrators ask for messages via get_messages_for_request(),
+    and this context manager decides how to fit them within limits. Compaction is
+    handled internally - orchestrators don't know or care about compaction.
     """
 
     def __init__(
@@ -62,18 +66,16 @@ class SimpleContextManager:
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
 
-        Note: This method always accepts messages without hard limits.
-        Compaction is handled by the orchestrator at strategic points
-        (before LLM requests) to keep context within bounds.
+        Messages are always accepted. Compaction happens internally when
+        get_messages_for_request() is called before LLM requests.
 
         Tool results MUST be added even if over threshold, otherwise
-        tool_use/tool_result pairing breaks. The orchestrator will
-        compact before the next LLM request.
+        tool_use/tool_result pairing breaks.
         """
         # Estimate tokens for this message
         message_tokens = len(str(message)) // 4
 
-        # Add message (no rejection - compaction happens at orchestrator level)
+        # Add message (no rejection - compaction happens internally)
         self.messages.append(message)
         self._token_count += message_tokens
 
@@ -82,7 +84,7 @@ class SimpleContextManager:
         if usage > 1.0:
             logger.warning(
                 f"Context at {usage:.1%} of max ({self._token_count:,}/{self.max_tokens:,} tokens). "
-                f"Compaction will run before next LLM request."
+                f"Compaction will run on next get_messages_for_request() call."
             )
 
         logger.debug(
@@ -91,20 +93,55 @@ class SimpleContextManager:
             f"({usage:.1%})"
         )
 
-    async def get_messages(self) -> list[dict[str, Any]]:
-        """Get all messages in the context."""
+    async def get_messages_for_request(self, token_budget: int | None = None) -> list[dict[str, Any]]:
+        """
+        Get messages ready for an LLM request.
+
+        Handles compaction internally if needed. Orchestrators call this before
+        every LLM request and trust the context manager to return messages that
+        fit within limits.
+
+        Args:
+            token_budget: Optional token limit. If None, uses configured max.
+
+        Returns:
+            Messages ready for LLM request, compacted if necessary.
+        """
+        budget = token_budget or self.max_tokens
+
+        # Check if compaction needed
+        if self._should_compact(budget):
+            await self._compact_internal()
+
         return self.messages.copy()
 
-    async def should_compact(self) -> bool:
-        """Check if context should be compacted."""
-        usage = self._token_count / self.max_tokens
+    async def get_messages(self) -> list[dict[str, Any]]:
+        """Get all messages (raw, uncompacted) for transcripts/debugging."""
+        return self.messages.copy()
+
+    async def set_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Set messages from a saved transcript (for session resume)."""
+        self.messages = messages.copy()
+        self._recalculate_tokens()
+        logger.info(f"Restored {len(messages)} messages to context")
+
+    async def clear(self) -> None:
+        """Clear all messages."""
+        self.messages = []
+        self._token_count = 0
+        logger.info("Context cleared")
+
+    def _should_compact(self, budget: int | None = None) -> bool:
+        """Internal: Check if context should be compacted."""
+        effective_budget = budget or self.max_tokens
+        usage = self._token_count / effective_budget
         should = usage >= self.compact_threshold
         if should:
-            logger.info(f"Context at {usage:.1%} capacity, compaction recommended")
+            logger.info(f"Context at {usage:.1%} capacity, compaction needed")
         return should
 
-    async def compact(self) -> None:
-        """Compact the context while preserving tool_use/tool_result pairs as atomic units.
+    async def _compact_internal(self) -> None:
+        """Internal: Compact the context while preserving tool_use/tool_result pairs.
 
         Anthropic API requires that tool_use blocks in message N have matching tool_result
         blocks in message N+1. These pairs are treated as atomic units during compaction:
@@ -222,18 +259,6 @@ class SimpleContextManager:
             f"Compacted {old_count} → {len(final)} messages "
             f"({tool_use_count} tool_use, {tool_result_count} tool_result pairs preserved)"
         )
-
-    async def set_messages(self, messages: list[dict[str, Any]]) -> None:
-        """Set messages from a saved transcript (for session resume)."""
-        self.messages = messages.copy()
-        self._recalculate_tokens()
-        logger.info(f"Restored {len(messages)} messages to context")
-
-    async def clear(self) -> None:
-        """Clear all messages."""
-        self.messages = []
-        self._token_count = 0
-        logger.info("Context cleared")
 
     def _recalculate_tokens(self):
         """Recalculate token count after compaction."""
