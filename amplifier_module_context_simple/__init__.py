@@ -79,14 +79,7 @@ class SimpleContextManager:
         self.messages.append(message)
         self._token_count += message_tokens
 
-        # Warn if significantly over threshold (but don't reject)
         usage = self._token_count / self.max_tokens
-        if usage > 1.0:
-            logger.warning(
-                f"Context at {usage:.1%} of max ({self._token_count:,}/{self.max_tokens:,} tokens). "
-                f"Compaction will run on next get_messages_for_request() call."
-            )
-
         logger.debug(
             f"Added message: {message.get('role', 'unknown')} - "
             f"{len(self.messages)} total messages, {self._token_count:,} tokens "
