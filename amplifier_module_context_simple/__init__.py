@@ -221,7 +221,7 @@ class SimpleContextManager:
 
             # Build removal candidates (oldest first, excluding protected)
             removal_candidates = []
-            for i, msg in enumerate(self.messages):
+            for i, _msg in enumerate(self.messages):
                 if i not in protected_indices:
                     removal_candidates.append(i)
 
