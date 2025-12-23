@@ -253,14 +253,28 @@ class SimpleContextManager:
                             break
 
                 # If this is an assistant with tool_calls, also remove all its tool results
+                # CRITICAL: Only remove the pair if ALL tool_results can be removed
+                # If any tool_result is protected, we must keep the entire pair to avoid orphans
                 elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    indices_to_remove.add(i)
+                    # First, check if ALL tool results can be removed (not in protected_indices)
+                    all_tool_results_removable = True
+                    tool_result_indices = []
                     for tc in msg.get("tool_calls", []):
                         tc_id = tc.get("id") or tc.get("tool_call_id")
                         if tc_id:
                             for k, m in enumerate(self.messages):
-                                if m.get("tool_call_id") == tc_id and k not in protected_indices:
-                                    indices_to_remove.add(k)
+                                if m.get("tool_call_id") == tc_id:
+                                    if k in protected_indices:
+                                        all_tool_results_removable = False
+                                    else:
+                                        tool_result_indices.append(k)
+
+                    # Only remove the assistant and its tool results if ALL can be removed
+                    if all_tool_results_removable:
+                        indices_to_remove.add(i)
+                        for k in tool_result_indices:
+                            indices_to_remove.add(k)
+                    # else: Skip this assistant message - we cannot remove it without orphaning tool_results
 
                 # Regular message - just remove it
                 else:
