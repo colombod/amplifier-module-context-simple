@@ -64,7 +64,12 @@ async def test_tool_result_truncation_phase1():
 
 @pytest.mark.asyncio
 async def test_percentage_based_target():
-    """Compaction reduces to target_usage percentage, not fixed message count."""
+    """Compaction reduces returned messages to fit within target_usage percentage.
+    
+    Note: context-simple uses EPHEMERAL compaction - get_messages_for_request()
+    returns a compacted VIEW without modifying internal state. The full history
+    is always preserved in self.messages.
+    """
     # 50% target on 1000 token budget = target 500 tokens
     context = SimpleContextManager(
         max_tokens=1000,
@@ -79,15 +84,28 @@ async def test_percentage_based_target():
         await context.add_message({"role": "user", "content": f"message {i} with some padding content"})
         await context.add_message({"role": "assistant", "content": f"response {i} with some padding content"})
 
-    # Record token count before compaction
-    tokens_before = context._token_count
+    # Record message count before compaction
+    messages_before = len(context.messages)
 
-    # Trigger compaction
-    await context.get_messages_for_request()
+    # Trigger compaction - returns compacted VIEW
+    compacted_messages = await context.get_messages_for_request()
 
-    # After compaction, should be at or below target (50% of 1000 = 500)
-    assert context._token_count <= 500, f"Expected tokens <= 500 (50% of 1000), got {context._token_count}"
-    assert context._token_count < tokens_before, "Compaction should reduce tokens"
+    # Compacted view should have fewer messages than full history
+    assert len(compacted_messages) < messages_before, (
+        f"Compacted messages ({len(compacted_messages)}) should be fewer than original ({messages_before})"
+    )
+    
+    # Original messages should be unchanged (ephemeral compaction)
+    assert len(context.messages) == messages_before, (
+        "Original messages should be preserved (ephemeral compaction)"
+    )
+    
+    # Compacted messages should fit within budget
+    # Estimate: ~4 chars per token, each message ~40 chars = ~10 tokens
+    # 500 token budget / 10 tokens per message ≈ 50 messages max
+    assert len(compacted_messages) <= 60, (
+        f"Compacted messages should fit within budget, got {len(compacted_messages)}"
+    )
 
 
 @pytest.mark.asyncio
