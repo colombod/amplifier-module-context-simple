@@ -296,21 +296,36 @@ class SimpleContextManager:
 
             msg = messages[i]
 
-            # If this is a tool result, also mark its tool_use for removal
+            # If this is a tool result, find its tool_use and check if the ENTIRE pair can be removed
+            # CRITICAL: Only remove the pair if ALL tool_results can be removed (same as assistant path)
             if msg.get("role") == "tool":
                 # Find the assistant with tool_calls
                 for j in range(i - 1, -1, -1):
                     check_msg = messages[j]
                     if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
-                        if j not in protected_indices:
+                        # Check if assistant is protected
+                        if j in protected_indices:
+                            break  # Can't remove protected assistant, skip this candidate
+                        
+                        # Check if ALL tool_results for this assistant can be removed
+                        all_tool_results_removable = True
+                        tool_result_indices = []
+                        for tc in check_msg.get("tool_calls", []):
+                            tc_id = tc.get("id") or tc.get("tool_call_id")
+                            if tc_id:
+                                for k, m in enumerate(messages):
+                                    if m.get("tool_call_id") == tc_id:
+                                        if k in protected_indices:
+                                            all_tool_results_removable = False
+                                        else:
+                                            tool_result_indices.append(k)
+                        
+                        # Only remove if ALL tool_results can be removed (preserves pairs)
+                        if all_tool_results_removable:
                             indices_to_remove.add(j)
-                            # Also remove ALL tool results for this tool_use
-                            for tc in check_msg.get("tool_calls", []):
-                                tc_id = tc.get("id") or tc.get("tool_call_id")
-                                if tc_id:
-                                    for k, m in enumerate(messages):
-                                        if m.get("tool_call_id") == tc_id and k not in protected_indices:
-                                            indices_to_remove.add(k)
+                            for k in tool_result_indices:
+                                indices_to_remove.add(k)
+                        # If not all removable, skip this candidate entirely (don't orphan anything)
                         break
                     if check_msg.get("role") != "tool":
                         break
