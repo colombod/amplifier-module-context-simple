@@ -550,9 +550,13 @@ class SimpleContextManager:
 
         Priority:
         1. Explicit token_budget parameter (deprecated but supported)
-        2. Provider model info (context_window - max_output_tokens - safety_margin)
+        2. Provider model info (context_window - reserved_output - safety_margin)
         3. Provider defaults (legacy: some providers may put limits here)
         4. Configured max_tokens fallback
+
+        Note: We reserve only 50% of max_output_tokens since most responses are
+        much smaller than the maximum. This prevents over-conservative budgets
+        that would trigger compaction too early.
         """
         # Explicit budget takes precedence (for backward compatibility)
         if token_budget is not None:
@@ -560,6 +564,7 @@ class SimpleContextManager:
             return token_budget
 
         safety_margin = 1000  # Buffer to avoid hitting hard limits
+        output_reserve_fraction = 0.5  # Reserve 50% of max output (most responses are smaller)
 
         # Try provider-based dynamic budget
         if provider is not None:
@@ -572,10 +577,12 @@ class SimpleContextManager:
                         context_window = getattr(model_info, "context_window", None)
                         max_output = getattr(model_info, "max_output_tokens", None)
                         if context_window and max_output:
-                            budget = context_window - max_output - safety_margin
+                            reserved_output = int(max_output * output_reserve_fraction)
+                            budget = context_window - reserved_output - safety_margin
                             logger.info(
                                 f"Budget from provider model info: {budget:,} "
-                                f"(context={context_window:,}, output={max_output:,})"
+                                f"(context={context_window:,}, reserved_output={reserved_output:,} "
+                                f"[{output_reserve_fraction:.0%} of {max_output:,}])"
                             )
                             return budget
 
@@ -586,10 +593,12 @@ class SimpleContextManager:
                 max_output_tokens = defaults.get("max_output_tokens")
 
                 if context_window and max_output_tokens:
-                    budget = context_window - max_output_tokens - safety_margin
+                    reserved_output = int(max_output_tokens * output_reserve_fraction)
+                    budget = context_window - reserved_output - safety_margin
                     logger.info(
                         f"Budget from provider defaults: {budget:,} "
-                        f"(context={context_window:,}, output={max_output_tokens:,})"
+                        f"(context={context_window:,}, reserved_output={reserved_output:,} "
+                        f"[{output_reserve_fraction:.0%} of {max_output_tokens:,}])"
                     )
                     return budget
                 else:
