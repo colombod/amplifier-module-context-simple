@@ -129,11 +129,12 @@ async def test_compact_never_deduplicates_tool_messages():
     This test verifies that tool pairs with identical content are NOT deduplicated -
     if multiple pairs exist, they remain separate (not merged into one).
     """
-    # Use protected_recent=0.8 to keep both tool pairs in protected zone
+    # Use high max_tokens so compaction only truncates, doesn't remove
+    # This ensures both tool pairs survive and we can verify no deduplication
     context = SimpleContextManager(
-        max_tokens=100,
+        max_tokens=500,  # Higher budget - compaction truncates but doesn't remove
         compact_threshold=0.5,
-        protected_recent=0.8,  # Protect 80% of messages to keep both tool pairs
+        protected_recent=0.9,  # Protect 90% of messages
     )
 
     # Add tool pair twice with same content but different IDs

@@ -65,15 +65,24 @@ class SimpleContextManager:
     and this context manager decides how to fit them within limits. Compaction is
     handled internally and ephemerally - the original history is always preserved.
 
-    Compaction Strategy (Truncation-First):
-    1. Trigger when usage >= compact_threshold (default 92%)
-    2. Phase 1: Truncate ALL tool results EXCEPT the last N (preserve recent context)
-    3. Phase 2: Remove oldest messages until at target_usage% (default 50%)
-    4. Always protect: system messages, last user message, last N% of messages, tool pairs
+    Compaction Strategy (Progressive Interleaved):
+    Triggered when usage >= compact_threshold (default 92%), target is target_usage (default 50%).
     
-    This strategy prioritizes truncating verbose tool outputs before removing
-    conversational context, ensuring the assistant always knows what the user
-    is currently asking about.
+    Each level checks after every operation and stops as soon as target is reached:
+    
+    Level 1: Truncate oldest 25% of tool results
+    Level 2: Truncate next 25% of tool results (now 50% truncated)
+    Level 3: Remove oldest messages (use configured protected_recent)
+    Level 4: Truncate next 25% of tool results (now 75% truncated)
+    Level 5: Remove more messages (60% of configured protection)
+    Level 6: Truncate remaining tool results (except last N)
+    Level 7: Remove more messages (30% of configured protection - last resort)
+    
+    This interleaved approach ensures minimal data loss by:
+    - Preferring truncation (preserves structure) over removal (loses context)
+    - Progressively relaxing protection as pressure increases
+    - Respecting configured protected_recent as baseline, only relaxing under pressure
+    - Always protecting: system messages, last user message, last N tool results, tool pairs
     """
 
     def __init__(
@@ -187,13 +196,18 @@ class SimpleContextManager:
 
     def _compact_ephemeral(self, budget: int) -> list[dict[str, Any]]:
         """
-        Compact the context EPHEMERALLY using truncation-first strategy.
+        Compact the context EPHEMERALLY using progressive interleaved strategy.
 
         This returns a NEW list - self.messages is NEVER modified.
 
-        Two-phase approach:
-        1. Truncate ALL tool results except the last N (aggressive, preserves recent context)
-        2. Remove oldest messages if still over target (preserves tool pairs)
+        Progressive levels (each checks after every operation, stops when at target):
+        - Level 1: Truncate oldest 25% of tool results
+        - Level 2: Truncate next 25% (now 50% truncated)
+        - Level 3: Remove oldest messages (protect 50%)
+        - Level 4: Truncate next 25% (now 75% truncated)
+        - Level 5: Remove more messages (protect 30%)
+        - Level 6: Truncate remaining (except last N)
+        - Level 7: Remove more messages (protect 10%)
 
         Anthropic API requires that tool_use blocks in message N have matching tool_result
         blocks in message N+1. These pairs are treated as atomic units during compaction.
@@ -209,43 +223,297 @@ class SimpleContextManager:
 
         # Work on a copy - never modify self.messages
         working_messages = [dict(msg) for msg in self.messages]
+        current_tokens = old_tokens
 
-        # Phase 1: Truncate tool results (oldest first) EXCEPT the last N
-        # Find all tool result indices
+        # Get all tool result indices for wave-based truncation
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
+        total_tools = len(tool_result_indices)
         
-        # Protect the last N tool results from truncation
+        # Always protect the last N tool results from truncation
         protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
-        truncated_count = 0
-        current_tokens = old_tokens
+        
+        # Calculate wave boundaries (25% chunks)
+        wave1_end = int(total_tools * 0.25)
+        wave2_end = int(total_tools * 0.50)
+        wave3_end = int(total_tools * 0.75)
+        
+        total_truncated = 0
+        total_removed = 0
 
-        for i in tool_result_indices:
-            # Stop early if we've reached the target
-            if current_tokens <= target_tokens:
-                break
-            if i in protected_tool_indices:
-                continue  # Don't truncate protected recent tool results
-            msg = working_messages[i]
-            if not msg.get("_truncated"):
-                working_messages[i] = self._truncate_tool_result(msg)
-                truncated_count += 1
-                # Re-estimate after each truncation
-                current_tokens = self._estimate_tokens(working_messages)
+        # === LEVEL 1: Truncate oldest 25% of tool results ===
+        truncated, current_tokens = self._truncate_tool_wave(
+            working_messages, tool_result_indices[:wave1_end],
+            protected_tool_indices, target_tokens, current_tokens
+        )
+        total_truncated += truncated
+        if current_tokens <= target_tokens:
+            logger.info(f"Level 1: Truncated {truncated} tool results, reached target")
+            return self._finalize_compaction(working_messages, old_count, old_tokens)
+
+        # === LEVEL 2: Truncate next 25% (now 50% truncated) ===
+        truncated, current_tokens = self._truncate_tool_wave(
+            working_messages, tool_result_indices[wave1_end:wave2_end],
+            protected_tool_indices, target_tokens, current_tokens
+        )
+        total_truncated += truncated
+        if current_tokens <= target_tokens:
+            logger.info(f"Level 2: Truncated {truncated} more tool results, reached target")
+            return self._finalize_compaction(working_messages, old_count, old_tokens)
+
+        # === LEVEL 3: Remove oldest messages (use configured protection) ===
+        level3_protection = self.protected_recent  # Use configured value
+        working_messages, removed, current_tokens = self._remove_messages_with_protection(
+            working_messages, target_tokens, protected_recent=level3_protection
+        )
+        total_removed += removed
+        if current_tokens <= target_tokens:
+            logger.info(f"Level 3: Removed {removed} messages ({level3_protection:.0%} protected), reached target")
+            return self._finalize_compaction(working_messages, old_count, old_tokens)
+
+        # === LEVEL 4: Truncate next 25% (now 75% truncated) ===
+        # Recalculate indices after removal
+        tool_result_indices = [
+            i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
+        ]
+        protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
+        wave3_start = int(len(tool_result_indices) * 0.50)
+        wave3_end = int(len(tool_result_indices) * 0.75)
+        
+        truncated, current_tokens = self._truncate_tool_wave(
+            working_messages, tool_result_indices[wave3_start:wave3_end],
+            protected_tool_indices, target_tokens, current_tokens
+        )
+        total_truncated += truncated
+        if current_tokens <= target_tokens:
+            logger.info(f"Level 4: Truncated {truncated} more tool results, reached target")
+            return self._finalize_compaction(working_messages, old_count, old_tokens)
+
+        # === LEVEL 5: Remove more messages (60% of configured protection) ===
+        level5_protection = self.protected_recent * 0.6
+        working_messages, removed, current_tokens = self._remove_messages_with_protection(
+            working_messages, target_tokens, protected_recent=level5_protection
+        )
+        total_removed += removed
+        if current_tokens <= target_tokens:
+            logger.info(f"Level 5: Removed {removed} messages ({level5_protection:.0%} protected), reached target")
+            return self._finalize_compaction(working_messages, old_count, old_tokens)
+
+        # === LEVEL 6: Truncate remaining tool results (except last N) ===
+        tool_result_indices = [
+            i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
+        ]
+        protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
+        
+        truncated, current_tokens = self._truncate_tool_wave(
+            working_messages, tool_result_indices,
+            protected_tool_indices, target_tokens, current_tokens
+        )
+        total_truncated += truncated
+        if current_tokens <= target_tokens:
+            logger.info(f"Level 6: Truncated {truncated} remaining tool results, reached target")
+            return self._finalize_compaction(working_messages, old_count, old_tokens)
+
+        # === LEVEL 7: Remove more messages (30% of configured protection - last resort) ===
+        level7_protection = self.protected_recent * 0.3
+        working_messages, removed, current_tokens = self._remove_messages_with_protection(
+            working_messages, target_tokens, protected_recent=level7_protection
+        )
+        total_removed += removed
+        
         logger.info(
-            f"Phase 1: Truncated {truncated_count} tool results "
-            f"(protected last {self.protected_tool_results}). "
+            f"Level 7 complete ({level7_protection:.0%} protected): "
+            f"Truncated {total_truncated} total, removed {total_removed} total. "
             f"Tokens: {old_tokens:,} → {current_tokens:,}"
         )
+        
+        return self._finalize_compaction(working_messages, old_count, old_tokens)
 
-        # Phase 2: If still over target, remove oldest messages
-        if current_tokens > target_tokens:
-            working_messages = self._remove_oldest_until_target(
-                working_messages, target_tokens
+    def _truncate_tool_wave(
+        self,
+        messages: list[dict[str, Any]],
+        indices: list[int],
+        protected_indices: set[int],
+        target_tokens: int,
+        current_tokens: int,
+    ) -> tuple[int, int]:
+        """
+        Truncate a wave of tool results, stopping when target is reached.
+        
+        Returns (truncated_count, new_token_count).
+        """
+        truncated = 0
+        for i in indices:
+            if current_tokens <= target_tokens:
+                break
+            if i in protected_indices:
+                continue
+            if i >= len(messages):  # Index may be stale after removals
+                continue
+            msg = messages[i]
+            if msg.get("role") != "tool":  # Verify it's still a tool message
+                continue
+            if not msg.get("_truncated"):
+                messages[i] = self._truncate_tool_result(msg)
+                truncated += 1
+                current_tokens = self._estimate_tokens(messages)
+        return truncated, current_tokens
+
+    def _remove_messages_with_protection(
+        self,
+        messages: list[dict[str, Any]],
+        target_tokens: int,
+        protected_recent: float,
+    ) -> tuple[list[dict[str, Any]], int, int]:
+        """
+        Remove oldest messages with specified protection level.
+        
+        Returns (new_messages, removed_count, new_token_count).
+        """
+        # Determine protected indices
+        protected_indices = set()
+
+        # Always protect system messages
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                protected_indices.add(i)
+
+        # Always protect the LAST user message
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                protected_indices.add(i)
+                break
+
+        # Protect last N% of messages (using the passed protection level)
+        protected_boundary = int(len(messages) * (1 - protected_recent))
+        for i in range(protected_boundary, len(messages)):
+            protected_indices.add(i)
+
+        # Build removal candidates (oldest first, excluding protected)
+        removal_candidates = [i for i in range(len(messages)) if i not in protected_indices]
+
+        # Remove messages until under target, preserving tool pairs
+        indices_to_remove = set()
+        current_tokens = self._estimate_tokens(messages)
+
+        for i in removal_candidates:
+            if current_tokens <= target_tokens:
+                break
+
+            msg = messages[i]
+
+            # Handle tool result - must remove with its tool_use pair
+            if msg.get("role") == "tool":
+                pair_removed = self._try_remove_tool_pair_from_result(
+                    messages, i, protected_indices, indices_to_remove
+                )
+                if not pair_removed:
+                    continue  # Can't remove this one, skip
+
+            # Handle assistant with tool_calls - must remove with all its tool results
+            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                pair_removed = self._try_remove_tool_pair_from_assistant(
+                    messages, i, msg, protected_indices, indices_to_remove
+                )
+                if not pair_removed:
+                    continue  # Can't remove this one, skip
+
+            # Regular message - just mark for removal
+            else:
+                indices_to_remove.add(i)
+
+            # Update token estimate after each removal decision
+            removed_tokens = sum(
+                len(str(messages[idx])) // 4 for idx in indices_to_remove
             )
+            current_tokens = self._estimate_tokens(messages) - removed_tokens
 
-        # Log final state
+        # Build final message list excluding removed indices
+        result = [msg for i, msg in enumerate(messages) if i not in indices_to_remove]
+        final_tokens = self._estimate_tokens(result)
+
+        return result, len(indices_to_remove), final_tokens
+
+    def _try_remove_tool_pair_from_result(
+        self,
+        messages: list[dict[str, Any]],
+        result_idx: int,
+        protected_indices: set[int],
+        indices_to_remove: set[int],
+    ) -> bool:
+        """Try to remove a tool result and its paired assistant. Returns True if successful."""
+        # Find the assistant with tool_calls
+        for j in range(result_idx - 1, -1, -1):
+            check_msg = messages[j]
+            if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
+                if j in protected_indices:
+                    return False  # Can't remove protected assistant
+                
+                # Check if ALL tool_results for this assistant can be removed
+                all_removable, tool_result_indices = self._check_tool_pair_removable(
+                    messages, check_msg, protected_indices
+                )
+                
+                if all_removable:
+                    indices_to_remove.add(j)
+                    for k in tool_result_indices:
+                        indices_to_remove.add(k)
+                    return True
+                return False
+            if check_msg.get("role") != "tool":
+                break
+        return False
+
+    def _try_remove_tool_pair_from_assistant(
+        self,
+        messages: list[dict[str, Any]],
+        assistant_idx: int,
+        assistant_msg: dict[str, Any],
+        protected_indices: set[int],
+        indices_to_remove: set[int],
+    ) -> bool:
+        """Try to remove an assistant with tool_calls and all its results. Returns True if successful."""
+        all_removable, tool_result_indices = self._check_tool_pair_removable(
+            messages, assistant_msg, protected_indices
+        )
+        
+        if all_removable:
+            indices_to_remove.add(assistant_idx)
+            for k in tool_result_indices:
+                indices_to_remove.add(k)
+            return True
+        return False
+
+    def _check_tool_pair_removable(
+        self,
+        messages: list[dict[str, Any]],
+        assistant_msg: dict[str, Any],
+        protected_indices: set[int],
+    ) -> tuple[bool, list[int]]:
+        """Check if all tool results for an assistant can be removed. Returns (all_removable, result_indices)."""
+        all_removable = True
+        tool_result_indices = []
+        
+        for tc in assistant_msg.get("tool_calls", []):
+            tc_id = tc.get("id") or tc.get("tool_call_id")
+            if tc_id:
+                for k, m in enumerate(messages):
+                    if m.get("tool_call_id") == tc_id:
+                        if k in protected_indices:
+                            all_removable = False
+                        else:
+                            tool_result_indices.append(k)
+        
+        return all_removable, tool_result_indices
+
+    def _finalize_compaction(
+        self,
+        working_messages: list[dict[str, Any]],
+        old_count: int,
+        old_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Log final compaction state and return the result."""
         final_tokens = self._estimate_tokens(working_messages)
         tool_use_count = sum(1 for m in working_messages if m.get("tool_calls"))
         tool_result_count = sum(1 for m in working_messages if m.get("role") == "tool")
@@ -254,7 +522,6 @@ class SimpleContextManager:
             f"{old_tokens:,} → {final_tokens:,} tokens "
             f"({tool_use_count} tool_use, {tool_result_count} tool_result pairs preserved)"
         )
-
         return working_messages
 
     def _truncate_tool_result(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -274,124 +541,6 @@ class SimpleContextManager:
             "_truncated": True,
             "_original_tokens": original_tokens,
         }
-
-    def _remove_oldest_until_target(
-        self, messages: list[dict[str, Any]], target_tokens: int
-    ) -> list[dict[str, Any]]:
-        """
-        Remove oldest non-protected messages until under target.
-
-        Protected: system messages, recent messages, complete tool pairs.
-        Returns a NEW list.
-        """
-        # Determine protected indices
-        protected_indices = set()
-
-        # Always protect system messages
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                protected_indices.add(i)
-
-        # Always protect the LAST user message (contains current task/intent)
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                protected_indices.add(i)
-                break  # Only protect the last one
-
-        # Always protect last N% of messages
-        protected_boundary = int(len(messages) * (1 - self.protected_recent))
-        for i in range(protected_boundary, len(messages)):
-            protected_indices.add(i)
-
-        # Build removal candidates (oldest first, excluding protected)
-        removal_candidates = []
-        for i, _msg in enumerate(messages):
-            if i not in protected_indices:
-                removal_candidates.append(i)
-
-        # Remove messages until under target, preserving tool pairs
-        indices_to_remove = set()
-        current_tokens = self._estimate_tokens(messages)
-
-        for i in removal_candidates:
-            if current_tokens <= target_tokens:
-                break
-
-            msg = messages[i]
-
-            # If this is a tool result, find its tool_use and check if the ENTIRE pair can be removed
-            # CRITICAL: Only remove the pair if ALL tool_results can be removed (same as assistant path)
-            if msg.get("role") == "tool":
-                # Find the assistant with tool_calls
-                for j in range(i - 1, -1, -1):
-                    check_msg = messages[j]
-                    if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
-                        # Check if assistant is protected
-                        if j in protected_indices:
-                            break  # Can't remove protected assistant, skip this candidate
-                        
-                        # Check if ALL tool_results for this assistant can be removed
-                        all_tool_results_removable = True
-                        tool_result_indices = []
-                        for tc in check_msg.get("tool_calls", []):
-                            tc_id = tc.get("id") or tc.get("tool_call_id")
-                            if tc_id:
-                                for k, m in enumerate(messages):
-                                    if m.get("tool_call_id") == tc_id:
-                                        if k in protected_indices:
-                                            all_tool_results_removable = False
-                                        else:
-                                            tool_result_indices.append(k)
-                        
-                        # Only remove if ALL tool_results can be removed (preserves pairs)
-                        if all_tool_results_removable:
-                            indices_to_remove.add(j)
-                            for k in tool_result_indices:
-                                indices_to_remove.add(k)
-                        # If not all removable, skip this candidate entirely (don't orphan anything)
-                        break
-                    if check_msg.get("role") != "tool":
-                        break
-
-            # If this is an assistant with tool_calls, also remove all its tool results
-            # CRITICAL: Only remove the pair if ALL tool_results can be removed
-            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-                all_tool_results_removable = True
-                tool_result_indices = []
-                for tc in msg.get("tool_calls", []):
-                    tc_id = tc.get("id") or tc.get("tool_call_id")
-                    if tc_id:
-                        for k, m in enumerate(messages):
-                            if m.get("tool_call_id") == tc_id:
-                                if k in protected_indices:
-                                    all_tool_results_removable = False
-                                else:
-                                    tool_result_indices.append(k)
-
-                if all_tool_results_removable:
-                    indices_to_remove.add(i)
-                    for k in tool_result_indices:
-                        indices_to_remove.add(k)
-
-            # Regular message - just remove it
-            else:
-                indices_to_remove.add(i)
-
-            # Update token estimate
-            removed_tokens = sum(
-                len(str(messages[idx])) // 4 for idx in indices_to_remove if idx not in protected_indices
-            )
-            current_tokens = self._estimate_tokens(messages) - removed_tokens
-
-        # Build final message list excluding removed indices
-        result = [msg for i, msg in enumerate(messages) if i not in indices_to_remove]
-
-        logger.info(
-            f"Phase 2: Removed {len(indices_to_remove)} messages. "
-            f"Tokens: {self._estimate_tokens(messages):,} → {self._estimate_tokens(result):,}"
-        )
-
-        return result
 
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
         """Calculate effective token budget from provider or fallback to config.
