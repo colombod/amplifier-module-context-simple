@@ -66,14 +66,22 @@ Not suitable for:
 
 ## Compaction Strategy
 
-The SimpleContextManager compacts automatically when token usage reaches the configured threshold (default: 92% of max_tokens):
+The SimpleContextManager uses **ephemeral compaction** - `get_messages_for_request()` returns a compacted VIEW without modifying the internal message history. The full history is always preserved in memory.
 
-- **Keeps**: All system messages + last 10 conversation messages
-- **Deduplicates**: Non-tool messages (based on role and first 100 chars of content)
-- **Preserves tool pairs**: Tool_use and tool_result messages are treated as atomic units
-  - If keeping assistant message with tool_calls, keeps next tool message
-  - If keeping tool message, keeps previous assistant message
-  - Never deduplicates tool-related messages (each has unique ID)
+Compaction triggers when token usage reaches the configured threshold (default: 92% of max_tokens):
+
+### Protected Messages (Never Removed)
+
+- **System messages**: All system messages are always preserved
+- **First user message**: The original task/request is always protected (prevents losing context about what was originally asked)
+- **Last user message**: The most recent user input is always preserved
+- **Recent messages**: Last N% of messages (configurable via `protected_recent`)
+- **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
+
+### Compaction Phases
+
+1. **Phase 1 - Tool Result Truncation**: Older tool results are truncated to reduce token usage
+2. **Phase 2 - Message Removal**: Older non-protected messages are removed if still over budget
 
 ### Tool Pair Preservation
 

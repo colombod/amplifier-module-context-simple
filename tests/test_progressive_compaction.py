@@ -141,6 +141,42 @@ async def test_protected_recent_messages():
 
 
 @pytest.mark.asyncio
+async def test_first_user_message_always_preserved():
+    """First user message (original task/request) is always protected from removal.
+    
+    This is important because the first user message often contains the original
+    task or request, and losing it causes the AI to lose context about what was
+    originally asked.
+    """
+    context = SimpleContextManager(
+        max_tokens=500,
+        compact_threshold=0.5,
+        target_usage=0.3,
+        protected_recent=0.1,  # Only protect 10% of recent messages
+    )
+
+    # First user message - this should always be protected
+    first_user_content = "FIRST_USER_MESSAGE_ORIGINAL_TASK"
+    await context.add_message({"role": "user", "content": first_user_content})
+    await context.add_message({"role": "assistant", "content": "I'll help you with that."})
+
+    # Add many more messages to push the first message into the "old" zone
+    for i in range(20):
+        await context.add_message({"role": "user", "content": f"follow up message {i} with padding"})
+        await context.add_message({"role": "assistant", "content": f"response {i} with padding content"})
+
+    # Trigger compaction
+    messages = await context.get_messages_for_request()
+
+    # First user message must be preserved
+    first_user_messages = [m for m in messages if m.get("content") == first_user_content]
+    assert len(first_user_messages) == 1, (
+        f"First user message should be preserved after compaction. "
+        f"Got {len(first_user_messages)} matches in {len(messages)} messages."
+    )
+
+
+@pytest.mark.asyncio
 async def test_system_messages_always_preserved():
     """System messages are never removed or truncated."""
     context = SimpleContextManager(

@@ -82,7 +82,7 @@ class SimpleContextManager:
     - Preferring truncation (preserves structure) over removal (loses context)
     - Progressively relaxing protection as pressure increases
     - Respecting configured protected_recent as baseline, only relaxing under pressure
-    - Always protecting: system messages, last user message, last N tool results, tool pairs
+    - Always protecting: system messages, first user message, last user message, last N tool results, tool pairs
     """
 
     def __init__(
@@ -382,7 +382,13 @@ class SimpleContextManager:
             if msg.get("role") == "system":
                 protected_indices.add(i)
 
-        # Always protect the LAST user message
+        # Always protect the FIRST user message (contains original task/request)
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user":
+                protected_indices.add(i)
+                break
+
+        # Always protect the LAST user message (current context)
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 protected_indices.add(i)
