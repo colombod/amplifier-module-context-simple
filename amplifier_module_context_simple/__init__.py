@@ -78,12 +78,14 @@ class SimpleContextManager:
     Level 5: Remove more messages (60% of configured protection)
     Level 6: Truncate remaining tool results (except last N)
     Level 7: Remove more messages (30% of configured protection - last resort)
+    Level 8: Stub first user message + remove old stubs (extreme pressure)
     
     This interleaved approach ensures minimal data loss by:
     - Preferring truncation (preserves structure) over removal (loses context)
     - Progressively relaxing protection as pressure increases
     - Respecting configured protected_recent as baseline, only relaxing under pressure
-    - Always protecting: system messages, first user message, last user message, last N tool results, tool pairs
+    - Always protecting: system messages, last user message, last N tool results, tool pairs
+    - First user message: stubbable at Level 8, but never fully removed
     """
 
     def __init__(
@@ -364,6 +366,65 @@ class SimpleContextManager:
             f"Truncated {total_truncated} total, removed {total_removed} total, stubbed {total_stubbed} total. "
             f"Tokens: {old_tokens:,} → {current_tokens:,}"
         )
+
+        # Check if we still need more space
+        if current_tokens > target_tokens:
+            # === LEVEL 8: Stub first user message + remove old stubs (extreme pressure) ===
+            max_level_reached = 8
+            
+            # Find first user message and stub it if not already stubbed
+            first_user_idx = None
+            last_user_idx = None
+            for i, msg in enumerate(working_messages):
+                if msg.get("role") == "user":
+                    if first_user_idx is None:
+                        first_user_idx = i
+                    last_user_idx = i
+            
+            # Stub first user message (previously protected)
+            if first_user_idx is not None:
+                first_msg = working_messages[first_user_idx]
+                if not first_msg.get("_stubbed"):
+                    content = first_msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 80:
+                        working_messages[first_user_idx] = self._stub_user_message(first_msg)
+                        total_stubbed += 1
+                        savings = (len(content) - 70) // 4
+                        current_tokens -= savings
+                        logger.info(f"Level 8: Stubbed first user message (saved ~{savings} tokens)")
+            
+            # Remove old stubs if still over target (oldest first, outside protected zone)
+            if current_tokens > target_tokens:
+                protected_boundary = int(len(working_messages) * (1 - level7_protection))
+                old_stub_indices = [
+                    i for i, msg in enumerate(working_messages)
+                    if msg.get("_stubbed")
+                    and i < protected_boundary  # Outside protected recent zone
+                    and i != last_user_idx  # Never remove last user message
+                ]
+                
+                stubs_removed = 0
+                indices_to_remove = set()
+                for i in old_stub_indices:  # Already sorted oldest-first
+                    if current_tokens <= target_tokens:
+                        break
+                    indices_to_remove.add(i)
+                    stubs_removed += 1
+                    current_tokens -= 18  # Stub is ~70 chars = ~18 tokens
+                
+                if indices_to_remove:
+                    working_messages = [
+                        msg for i, msg in enumerate(working_messages)
+                        if i not in indices_to_remove
+                    ]
+                    total_removed += stubs_removed
+                    logger.info(f"Level 8: Removed {stubs_removed} old user stubs")
+            
+            logger.info(
+                f"Level 8 complete (extreme pressure): "
+                f"Stubbed {total_stubbed} total, removed {total_removed} total. "
+                f"Tokens: {old_tokens:,} → {current_tokens:,}"
+            )
         
         return self._finalize_compaction_with_stats(
             working_messages, old_count, old_tokens, total_removed, total_truncated,
@@ -435,9 +496,9 @@ class SimpleContextManager:
             if msg.get("role") == "system":
                 protected_indices.add(i)
 
-        # Always protect the FIRST user message (contains original task/request)
-        if first_user_idx is not None:
-            protected_indices.add(first_user_idx)
+        # First user message is stubbable at extreme pressure (Level 8), but never fully removed
+        # (It's excluded from removal_candidates via user_message_indices, but can be stubbed)
+        # We don't add it to protected_indices so it can be stubbed at Level 8
 
         # Always protect the LAST user message (current context)
         if last_user_idx is not None:
@@ -491,11 +552,13 @@ class SimpleContextManager:
             current_tokens = self._estimate_tokens(messages) - removed_tokens
 
         # After removals, stub intermediate user messages if still over target
+        # At normal levels (1-7), still protect first/last from stubbing
+        # Level 8 will handle first user message stubbing separately
         stub_candidates = sorted([
             i for i in user_message_indices
             if i not in protected_indices
-            and i != first_user_idx
-            and i != last_user_idx
+            and i != first_user_idx  # Protected from stubbing at levels 1-7
+            and i != last_user_idx   # Always protected (never stubbed)
             and not messages[i].get("_stubbed")  # Don't re-stub
         ])
 
