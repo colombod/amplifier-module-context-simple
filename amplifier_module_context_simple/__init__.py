@@ -191,7 +191,10 @@ class SimpleContextManager:
         usage = token_count / budget if budget > 0 else 0
         should = usage >= self.compact_threshold
         if should:
-            logger.info(f"Context at {usage:.1%} capacity, compaction needed")
+            logger.info(
+                f"Context at {usage:.1%} capacity ({token_count:,}/{budget:,} tokens), "
+                f"threshold {self.compact_threshold:.0%} - compaction needed"
+            )
         return should
 
     def _compact_ephemeral(self, budget: int) -> list[dict[str, Any]]:
@@ -547,33 +550,58 @@ class SimpleContextManager:
 
         Priority:
         1. Explicit token_budget parameter (deprecated but supported)
-        2. Provider-based calculation: context_window - max_output_tokens - safety_margin
-        3. Configured max_tokens fallback
+        2. Provider model info (context_window - max_output_tokens - safety_margin)
+        3. Provider defaults (legacy: some providers may put limits here)
+        4. Configured max_tokens fallback
         """
         # Explicit budget takes precedence (for backward compatibility)
         if token_budget is not None:
+            logger.debug(f"Using explicit token_budget: {token_budget}")
             return token_budget
+
+        safety_margin = 1000  # Buffer to avoid hitting hard limits
 
         # Try provider-based dynamic budget
         if provider is not None:
             try:
+                # First, try to get model info if provider exposes current model
+                # Some providers have get_model_info() or similar
+                if hasattr(provider, "get_model_info"):
+                    model_info = provider.get_model_info()
+                    if model_info:
+                        context_window = getattr(model_info, "context_window", None)
+                        max_output = getattr(model_info, "max_output_tokens", None)
+                        if context_window and max_output:
+                            budget = context_window - max_output - safety_margin
+                            logger.info(
+                                f"Budget from provider model info: {budget:,} "
+                                f"(context={context_window:,}, output={max_output:,})"
+                            )
+                            return budget
+
+                # Check provider info defaults (legacy approach)
                 info = provider.get_info()
                 defaults = info.defaults or {}
                 context_window = defaults.get("context_window")
                 max_output_tokens = defaults.get("max_output_tokens")
 
                 if context_window and max_output_tokens:
-                    safety_margin = 1000  # Buffer to avoid hitting hard limits
                     budget = context_window - max_output_tokens - safety_margin
-                    logger.debug(
-                        f"Calculated budget from provider: {budget} "
-                        f"(context={context_window}, output={max_output_tokens}, safety={safety_margin})"
+                    logger.info(
+                        f"Budget from provider defaults: {budget:,} "
+                        f"(context={context_window:,}, output={max_output_tokens:,})"
                     )
                     return budget
+                else:
+                    logger.debug(
+                        f"Provider defaults missing context_window ({context_window}) "
+                        f"or max_output_tokens ({max_output_tokens}), using fallback"
+                    )
             except Exception as e:
                 logger.debug(f"Could not get budget from provider: {e}")
 
         # Fall back to configured max_tokens
+        logger.info(f"Using fallback max_tokens budget: {self.max_tokens:,}")
         return self.max_tokens
 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
