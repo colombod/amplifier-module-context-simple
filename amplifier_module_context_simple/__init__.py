@@ -32,8 +32,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - max_tokens: Maximum context size (default: 200,000)
             - compact_threshold: Trigger compaction at this usage (default: 0.92)
             - target_usage: Compact down to this usage (default: 0.50)
-            - truncate_boundary: Truncate tool results in first N% of history (default: 0.50)
-            - protected_recent: Always protect last N% of messages (default: 0.10)
+            - protected_recent: Always protect last N% of messages (default: 0.30)
+            - protected_tool_results: Always protect last N tool results (default: 5)
             - truncate_chars: Characters to keep when truncating tool results (default: 250)
 
     Returns:
@@ -44,8 +44,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         max_tokens=config.get("max_tokens", 200_000),
         compact_threshold=config.get("compact_threshold", 0.92),
         target_usage=config.get("target_usage", 0.50),
-        truncate_boundary=config.get("truncate_boundary", 0.50),
-        protected_recent=config.get("protected_recent", 0.10),
+        protected_recent=config.get("protected_recent", 0.30),
+        protected_tool_results=config.get("protected_tool_results", 5),
         truncate_chars=config.get("truncate_chars", 250),
     )
     await coordinator.mount("context", context)
@@ -65,11 +65,15 @@ class SimpleContextManager:
     and this context manager decides how to fit them within limits. Compaction is
     handled internally and ephemerally - the original history is always preserved.
 
-    Compaction Strategy (Progressive Percentage-Based):
+    Compaction Strategy (Truncation-First):
     1. Trigger when usage >= compact_threshold (default 92%)
-    2. Phase 1: Truncate old tool results in first truncate_boundary% of history
+    2. Phase 1: Truncate ALL tool results EXCEPT the last N (preserve recent context)
     3. Phase 2: Remove oldest messages until at target_usage% (default 50%)
-    4. Always protect: system messages, last protected_recent% of messages, tool pairs
+    4. Always protect: system messages, last user message, last N% of messages, tool pairs
+    
+    This strategy prioritizes truncating verbose tool outputs before removing
+    conversational context, ensuring the assistant always knows what the user
+    is currently asking about.
     """
 
     def __init__(
@@ -77,8 +81,8 @@ class SimpleContextManager:
         max_tokens: int = 200_000,
         compact_threshold: float = 0.92,
         target_usage: float = 0.50,
-        truncate_boundary: float = 0.50,
-        protected_recent: float = 0.10,
+        protected_recent: float = 0.30,
+        protected_tool_results: int = 5,
         truncate_chars: int = 250,
     ):
         """
@@ -88,16 +92,16 @@ class SimpleContextManager:
             max_tokens: Maximum context size in tokens
             compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
             target_usage: Compact down to this usage ratio (0.0-1.0)
-            truncate_boundary: Truncate tool results in first N% of history (0.0-1.0)
             protected_recent: Always protect last N% of messages (0.0-1.0)
+            protected_tool_results: Always protect last N tool results from truncation
             truncate_chars: Characters to keep when truncating tool results
         """
         self.messages: list[dict[str, Any]] = []
         self.max_tokens = max_tokens
         self.compact_threshold = compact_threshold
         self.target_usage = target_usage
-        self.truncate_boundary = truncate_boundary
         self.protected_recent = protected_recent
+        self.protected_tool_results = protected_tool_results
         self.truncate_chars = truncate_chars
 
     async def add_message(self, message: dict[str, Any]) -> None:
@@ -183,12 +187,12 @@ class SimpleContextManager:
 
     def _compact_ephemeral(self, budget: int) -> list[dict[str, Any]]:
         """
-        Compact the context EPHEMERALLY using progressive percentage-based strategy.
+        Compact the context EPHEMERALLY using truncation-first strategy.
 
         This returns a NEW list - self.messages is NEVER modified.
 
         Two-phase approach:
-        1. Truncate old tool results (cheap, preserves conversation flow)
+        1. Truncate ALL tool results except the last N (aggressive, preserves recent context)
         2. Remove oldest messages if still over target (preserves tool pairs)
 
         Anthropic API requires that tool_use blocks in message N have matching tool_result
@@ -206,19 +210,32 @@ class SimpleContextManager:
         # Work on a copy - never modify self.messages
         working_messages = [dict(msg) for msg in self.messages]
 
-        # Phase 1: Truncate old tool results (in first truncate_boundary% of history)
-        truncate_boundary_idx = int(len(working_messages) * self.truncate_boundary)
+        # Phase 1: Truncate tool results (oldest first) EXCEPT the last N
+        # Find all tool result indices
+        tool_result_indices = [
+            i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
+        ]
+        
+        # Protect the last N tool results from truncation
+        protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
         truncated_count = 0
+        current_tokens = old_tokens
 
-        for i in range(truncate_boundary_idx):
+        for i in tool_result_indices:
+            # Stop early if we've reached the target
+            if current_tokens <= target_tokens:
+                break
+            if i in protected_tool_indices:
+                continue  # Don't truncate protected recent tool results
             msg = working_messages[i]
-            if msg.get("role") == "tool" and not msg.get("_truncated"):
+            if not msg.get("_truncated"):
                 working_messages[i] = self._truncate_tool_result(msg)
                 truncated_count += 1
-
-        current_tokens = self._estimate_tokens(working_messages)
+                # Re-estimate after each truncation
+                current_tokens = self._estimate_tokens(working_messages)
         logger.info(
-            f"Phase 1: Truncated {truncated_count} tool results in first {self.truncate_boundary:.0%} of history. "
+            f"Phase 1: Truncated {truncated_count} tool results "
+            f"(protected last {self.protected_tool_results}). "
             f"Tokens: {old_tokens:,} → {current_tokens:,}"
         )
 
@@ -274,6 +291,12 @@ class SimpleContextManager:
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 protected_indices.add(i)
+
+        # Always protect the LAST user message (contains current task/intent)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                protected_indices.add(i)
+                break  # Only protect the last one
 
         # Always protect last N% of messages
         protected_boundary = int(len(messages) * (1 - self.protected_recent))

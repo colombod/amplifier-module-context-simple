@@ -15,15 +15,15 @@ from amplifier_module_context_simple import SimpleContextManager
 @pytest.mark.asyncio
 async def test_tool_result_truncation_phase1():
     """Phase 1 truncates old tool results while preserving structure."""
-    # Configure for easy testing: low tokens, 50% truncate boundary
+    # Configure for easy testing: low tokens, aggressive truncation
     # Use lower max_tokens to ensure compaction triggers with our message sizes
     context = SimpleContextManager(
         max_tokens=300,  # Lower to ensure compaction triggers
         compact_threshold=0.5,
         target_usage=0.3,
-        truncate_boundary=0.5,
         truncate_chars=50,
         protected_recent=0.3,  # Protect recent messages but allow truncation of old tool
+        protected_tool_results=2,  # Only protect last 2 tool results
     )
 
     # Add a tool pair early (will be in truncate zone)
@@ -75,7 +75,6 @@ async def test_percentage_based_target():
         max_tokens=1000,
         compact_threshold=0.9,
         target_usage=0.5,
-        truncate_boundary=0.5,
         protected_recent=0.1,
     )
 
@@ -115,7 +114,6 @@ async def test_protected_recent_messages():
         max_tokens=500,
         compact_threshold=0.5,
         target_usage=0.3,
-        truncate_boundary=0.5,
         protected_recent=0.2,  # Protect last 20%
     )
 
