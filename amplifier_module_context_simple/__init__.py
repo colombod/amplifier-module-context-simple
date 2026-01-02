@@ -381,8 +381,9 @@ class SimpleContextManager:
                         first_user_idx = i
                     last_user_idx = i
             
-            # Stub first user message (previously protected)
-            if first_user_idx is not None:
+            # Stub first user message (previously protected) - but NEVER if it's also the last
+            # The last user message is the current intent and must always be preserved
+            if first_user_idx is not None and first_user_idx != last_user_idx:
                 first_msg = working_messages[first_user_idx]
                 if not first_msg.get("_stubbed"):
                     content = first_msg.get("content", "")
