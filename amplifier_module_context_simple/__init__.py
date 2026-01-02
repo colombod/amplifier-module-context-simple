@@ -165,7 +165,7 @@ class SimpleContextManager:
         # Check if compaction needed
         if self._should_compact(token_count, budget):
             # Compact EPHEMERALLY - returns new list, self.messages unchanged
-            compacted = self._compact_ephemeral(budget)
+            compacted = await self._compact_ephemeral(budget)
             logger.info(
                 f"Ephemeral compaction: {len(self.messages)} -> {len(compacted)} messages for this request"
             )
@@ -204,7 +204,7 @@ class SimpleContextManager:
             )
         return should
 
-    def _compact_ephemeral(self, budget: int) -> list[dict[str, Any]]:
+    async def _compact_ephemeral(self, budget: int) -> list[dict[str, Any]]:
         """
         Compact the context EPHEMERALLY using progressive interleaved strategy.
 
@@ -262,7 +262,7 @@ class SimpleContextManager:
         total_truncated += truncated
         if current_tokens <= target_tokens:
             logger.info(f"Level 1: Truncated {truncated} tool results, reached target")
-            return self._finalize_compaction_with_stats(
+            return await self._finalize_compaction_with_stats(
                 working_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
@@ -276,7 +276,7 @@ class SimpleContextManager:
         total_truncated += truncated
         if current_tokens <= target_tokens:
             logger.info(f"Level 2: Truncated {truncated} more tool results, reached target")
-            return self._finalize_compaction_with_stats(
+            return await self._finalize_compaction_with_stats(
                 working_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
@@ -291,7 +291,7 @@ class SimpleContextManager:
         total_stubbed += stubbed
         if current_tokens <= target_tokens:
             logger.info(f"Level 3: Removed {removed} messages, stubbed {stubbed} ({level3_protection:.0%} protected), reached target")
-            return self._finalize_compaction_with_stats(
+            return await self._finalize_compaction_with_stats(
                 working_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
@@ -313,7 +313,7 @@ class SimpleContextManager:
         total_truncated += truncated
         if current_tokens <= target_tokens:
             logger.info(f"Level 4: Truncated {truncated} more tool results, reached target")
-            return self._finalize_compaction_with_stats(
+            return await self._finalize_compaction_with_stats(
                 working_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
@@ -328,7 +328,7 @@ class SimpleContextManager:
         total_stubbed += stubbed
         if current_tokens <= target_tokens:
             logger.info(f"Level 5: Removed {removed} messages, stubbed {stubbed} ({level5_protection:.0%} protected), reached target")
-            return self._finalize_compaction_with_stats(
+            return await self._finalize_compaction_with_stats(
                 working_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
@@ -347,7 +347,7 @@ class SimpleContextManager:
         total_truncated += truncated
         if current_tokens <= target_tokens:
             logger.info(f"Level 6: Truncated {truncated} remaining tool results, reached target")
-            return self._finalize_compaction_with_stats(
+            return await self._finalize_compaction_with_stats(
                 working_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
@@ -426,7 +426,7 @@ class SimpleContextManager:
                 f"Tokens: {old_tokens:,} → {current_tokens:,}"
             )
         
-        return self._finalize_compaction_with_stats(
+        return await self._finalize_compaction_with_stats(
             working_messages, old_count, old_tokens, total_removed, total_truncated,
             total_stubbed, max_level_reached, budget, target_tokens
         )
@@ -659,7 +659,7 @@ class SimpleContextManager:
         
         return all_removable, tool_result_indices
 
-    def _finalize_compaction_with_stats(
+    async def _finalize_compaction_with_stats(
         self,
         working_messages: list[dict[str, Any]],
         old_count: int,
@@ -699,10 +699,9 @@ class SimpleContextManager:
         # Emit event if hooks available
         if self._hooks is not None:
             try:
-                import asyncio
-                asyncio.create_task(self._hooks.emit("context:compaction", stats))
+                await self._hooks.emit("context:compaction", stats)
             except Exception as e:
-                logger.debug(f"Could not emit compaction event: {e}")
+                logger.warning(f"Could not emit compaction event: {e}")
 
         return working_messages
 
