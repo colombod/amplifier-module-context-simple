@@ -9,12 +9,19 @@ Implements an in-memory context manager with EPHEMERAL compaction:
 
 This design ensures conversation history is never lost, even during compaction.
 For persistent storage across sessions, use context-persistent instead.
+
+Dynamic System Prompt Support:
+  • set_system_prompt_factory() registers a callable that produces fresh system content
+  • get_messages_for_request() calls the factory on EVERY request
+  • Enables @mentions and bundle instructions to be re-processed each turn
+  • Static system messages (via add_message) are still supported as fallback
 """
 
 # Amplifier module metadata
 __amplifier_module_type__ = "context"
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -119,6 +126,7 @@ class SimpleContextManager:
         self.truncate_chars = truncate_chars
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
+        self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
 
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
@@ -140,6 +148,26 @@ class SimpleContextManager:
             f"({usage:.1%})"
         )
 
+    async def set_system_prompt_factory(
+        self, factory: Callable[[], Awaitable[str]]
+    ) -> None:
+        """Set a factory function that produces fresh system prompt content.
+
+        The factory will be called on EVERY get_messages_for_request() call,
+        enabling dynamic content like @mentions to be re-processed each turn.
+
+        This is the preferred approach for bundle-based system prompts. When
+        set, the factory takes precedence over any static system messages
+        stored via add_message().
+
+        Args:
+            factory: Async callable that returns the system prompt string.
+                     The factory should handle @mention resolution, file
+                     loading, and instruction assembly.
+        """
+        self._system_prompt_factory = factory
+        logger.info("System prompt factory registered - will refresh on each request")
+
     async def get_messages_for_request(
         self,
         token_budget: int | None = None,
@@ -147,6 +175,10 @@ class SimpleContextManager:
     ) -> list[dict[str, Any]]:
         """
         Get messages ready for an LLM request.
+
+        If a system prompt factory is registered, it is called to produce fresh
+        system content on EVERY request. This enables dynamic @mentions and
+        bundle instructions to be re-processed each turn.
 
         Applies EPHEMERAL compaction if needed - returns a NEW list without
         modifying self.messages. The original history is always preserved.
@@ -160,19 +192,38 @@ class SimpleContextManager:
             Messages ready for LLM request, compacted if necessary.
         """
         budget = self._calculate_budget(token_budget, provider)
-        token_count = self._estimate_tokens(self.messages)
+
+        # Determine working messages based on whether factory is set
+        if self._system_prompt_factory:
+            # Factory mode: get fresh system content, exclude stored system messages
+            system_content = await self._system_prompt_factory()
+            system_message = {"role": "system", "content": system_content}
+
+            # Filter out any static system messages - factory takes precedence
+            conversation_messages = [
+                msg for msg in self.messages if msg.get("role") != "system"
+            ]
+            working_messages = [system_message] + conversation_messages
+            logger.debug(
+                f"System prompt factory produced {len(system_content):,} chars, "
+                f"{len(conversation_messages)} conversation messages"
+            )
+        else:
+            # Static mode: use messages as-is (may include stored system messages)
+            working_messages = list(self.messages)
+
+        token_count = self._estimate_tokens(working_messages)
 
         # Check if compaction needed
         if self._should_compact(token_count, budget):
-            # Compact EPHEMERALLY - returns new list, self.messages unchanged
-            compacted = await self._compact_ephemeral(budget)
+            # Compact EPHEMERALLY - returns new list, working_messages unchanged
+            compacted = await self._compact_ephemeral(budget, working_messages)
             logger.info(
-                f"Ephemeral compaction: {len(self.messages)} -> {len(compacted)} messages for this request"
+                f"Ephemeral compaction: {len(working_messages)} -> {len(compacted)} messages for this request"
             )
             return compacted
 
-        # Return a copy (never expose internal list directly)
-        return list(self.messages)
+        return working_messages
 
     async def get_messages(self) -> list[dict[str, Any]]:
         """
@@ -204,11 +255,13 @@ class SimpleContextManager:
             )
         return should
 
-    async def _compact_ephemeral(self, budget: int) -> list[dict[str, Any]]:
+    async def _compact_ephemeral(
+        self, budget: int, source_messages: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
         """
         Compact the context EPHEMERALLY using progressive interleaved strategy.
 
-        This returns a NEW list - self.messages is NEVER modified.
+        This returns a NEW list - the source messages are NEVER modified.
 
         CRITICAL: System messages are NEVER compacted. They are extracted at the start
         and re-inserted at the end, guaranteeing they are always preserved regardless
@@ -225,21 +278,27 @@ class SimpleContextManager:
 
         Anthropic API requires that tool_use blocks in message N have matching tool_result
         blocks in message N+1. These pairs are treated as atomic units during compaction.
+
+        Args:
+            budget: Token budget for compaction target calculation.
+            source_messages: Messages to compact. If None, uses self.messages.
+                             This allows compacting factory-generated message lists.
         """
+        messages_to_compact = source_messages if source_messages is not None else self.messages
         target_tokens = int(budget * self.target_usage)
-        old_count = len(self.messages)
-        old_tokens = self._estimate_tokens(self.messages)
+        old_count = len(messages_to_compact)
+        old_tokens = self._estimate_tokens(messages_to_compact)
 
         logger.info(
-            f"Compacting context: {len(self.messages)} messages, {old_tokens:,} tokens "
+            f"Compacting context: {len(messages_to_compact)} messages, {old_tokens:,} tokens "
             f"(target: {target_tokens:,} tokens, {self.target_usage:.0%} of {budget:,})"
         )
 
         # === CRITICAL: Extract system messages FIRST - they are NEVER compacted ===
         # System messages contain the agent's identity and instructions. Losing them
         # causes the agent to lose its persona and capabilities mid-conversation.
-        system_messages = [dict(msg) for msg in self.messages if msg.get("role") == "system"]
-        non_system_messages = [msg for msg in self.messages if msg.get("role") != "system"]
+        system_messages = [dict(msg) for msg in messages_to_compact if msg.get("role") == "system"]
+        non_system_messages = [msg for msg in messages_to_compact if msg.get("role") != "system"]
         
         if system_messages:
             system_tokens = self._estimate_tokens(system_messages)
