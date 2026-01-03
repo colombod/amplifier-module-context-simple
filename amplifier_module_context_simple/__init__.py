@@ -210,6 +210,10 @@ class SimpleContextManager:
 
         This returns a NEW list - self.messages is NEVER modified.
 
+        CRITICAL: System messages are NEVER compacted. They are extracted at the start
+        and re-inserted at the end, guaranteeing they are always preserved regardless
+        of compaction pressure.
+
         Progressive levels (each checks after every operation, stops when at target):
         - Level 1: Truncate oldest 25% of tool results
         - Level 2: Truncate next 25% (now 50% truncated)
@@ -231,8 +235,21 @@ class SimpleContextManager:
             f"(target: {target_tokens:,} tokens, {self.target_usage:.0%} of {budget:,})"
         )
 
-        # Work on a copy - never modify self.messages
-        working_messages = [dict(msg) for msg in self.messages]
+        # === CRITICAL: Extract system messages FIRST - they are NEVER compacted ===
+        # System messages contain the agent's identity and instructions. Losing them
+        # causes the agent to lose its persona and capabilities mid-conversation.
+        system_messages = [dict(msg) for msg in self.messages if msg.get("role") == "system"]
+        non_system_messages = [msg for msg in self.messages if msg.get("role") != "system"]
+        
+        if system_messages:
+            system_tokens = self._estimate_tokens(system_messages)
+            logger.info(
+                f"Preserving {len(system_messages)} system message(s) ({system_tokens:,} tokens) - "
+                f"these are NEVER compacted"
+            )
+        
+        # Work on non-system messages only - system messages bypass all compaction
+        working_messages = [dict(msg) for msg in non_system_messages]
         current_tokens = old_tokens
 
         # Get all tool result indices for wave-based truncation
@@ -263,7 +280,7 @@ class SimpleContextManager:
         if current_tokens <= target_tokens:
             logger.info(f"Level 1: Truncated {truncated} tool results, reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, old_count, old_tokens, total_removed, total_truncated,
+                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
 
@@ -277,7 +294,7 @@ class SimpleContextManager:
         if current_tokens <= target_tokens:
             logger.info(f"Level 2: Truncated {truncated} more tool results, reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, old_count, old_tokens, total_removed, total_truncated,
+                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
 
@@ -292,7 +309,7 @@ class SimpleContextManager:
         if current_tokens <= target_tokens:
             logger.info(f"Level 3: Removed {removed} messages, stubbed {stubbed} ({level3_protection:.0%} protected), reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, old_count, old_tokens, total_removed, total_truncated,
+                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
 
@@ -314,7 +331,7 @@ class SimpleContextManager:
         if current_tokens <= target_tokens:
             logger.info(f"Level 4: Truncated {truncated} more tool results, reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, old_count, old_tokens, total_removed, total_truncated,
+                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
 
@@ -329,7 +346,7 @@ class SimpleContextManager:
         if current_tokens <= target_tokens:
             logger.info(f"Level 5: Removed {removed} messages, stubbed {stubbed} ({level5_protection:.0%} protected), reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, old_count, old_tokens, total_removed, total_truncated,
+                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
 
@@ -348,7 +365,7 @@ class SimpleContextManager:
         if current_tokens <= target_tokens:
             logger.info(f"Level 6: Truncated {truncated} remaining tool results, reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, old_count, old_tokens, total_removed, total_truncated,
+                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
                 total_stubbed, max_level_reached, budget, target_tokens
             )
 
@@ -428,7 +445,7 @@ class SimpleContextManager:
             )
         
         return await self._finalize_compaction_with_stats(
-            working_messages, old_count, old_tokens, total_removed, total_truncated,
+            working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
             total_stubbed, max_level_reached, budget, target_tokens
         )
 
@@ -663,6 +680,7 @@ class SimpleContextManager:
     async def _finalize_compaction_with_stats(
         self,
         working_messages: list[dict[str, Any]],
+        system_messages: list[dict[str, Any]],
         old_count: int,
         old_tokens: int,
         total_removed: int,
@@ -672,25 +690,44 @@ class SimpleContextManager:
         budget: int,
         target_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Log final compaction state, store stats, emit event, and return the result."""
-        final_tokens = self._estimate_tokens(working_messages)
-        tool_use_count = sum(1 for m in working_messages if m.get("tool_calls"))
-        tool_result_count = sum(1 for m in working_messages if m.get("role") == "tool")
+        """Log final compaction state, store stats, emit event, and return the result.
+        
+        CRITICAL: This function prepends the preserved system messages to the compacted
+        working messages, ensuring system messages are ALWAYS in the final result.
+        """
+        # === CRITICAL: Prepend system messages to final result ===
+        # System messages were extracted before compaction and must be restored
+        final_messages = system_messages + working_messages
+        
+        final_tokens = self._estimate_tokens(final_messages)
+        system_count = len(system_messages)
+        tool_use_count = sum(1 for m in final_messages if m.get("tool_calls"))
+        tool_result_count = sum(1 for m in final_messages if m.get("role") == "tool")
+        
         logger.info(
-            f"Compaction complete: {old_count} → {len(working_messages)} messages, "
+            f"Compaction complete: {old_count} → {len(final_messages)} messages, "
             f"{old_tokens:,} → {final_tokens:,} tokens "
-            f"({tool_use_count} tool_use, {tool_result_count} tool_result pairs preserved)"
+            f"({system_count} system, {tool_use_count} tool_use, {tool_result_count} tool_result preserved)"
         )
+
+        # === SANITY CHECK: Verify system messages are present ===
+        result_system_count = sum(1 for m in final_messages if m.get("role") == "system")
+        if result_system_count != system_count:
+            logger.error(
+                f"CRITICAL: System message count mismatch! Expected {system_count}, got {result_system_count}. "
+                f"This indicates a bug in compaction logic."
+            )
 
         # Build and store stats for observability
         stats = {
             "before_tokens": old_tokens,
             "after_tokens": final_tokens,
             "before_messages": old_count,
-            "after_messages": len(working_messages),
+            "after_messages": len(final_messages),
             "messages_removed": total_removed,
             "messages_truncated": total_truncated,
             "user_messages_stubbed": total_stubbed,
+            "system_messages_preserved": system_count,
             "strategy_level": max_level_reached,
             "budget": budget,
             "target_tokens": target_tokens,
@@ -704,7 +741,7 @@ class SimpleContextManager:
             except Exception as e:
                 logger.warning(f"Could not emit compaction event: {e}")
 
-        return working_messages
+        return final_messages
 
     def _truncate_tool_result(self, msg: dict[str, Any]) -> dict[str, Any]:
         """

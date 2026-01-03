@@ -204,6 +204,67 @@ async def test_system_messages_always_preserved():
 
 
 @pytest.mark.asyncio
+async def test_system_messages_preserved_under_extreme_pressure():
+    """System messages are NEVER removed even under extreme compaction pressure.
+    
+    This test simulates the scenario that caused the original bug where a ~143KB
+    system prompt was completely dropped during compaction, causing the agent to
+    lose its identity and instructions mid-conversation.
+    
+    The fix extracts system messages BEFORE compaction and re-inserts them AFTER,
+    guaranteeing they are always preserved regardless of compaction level.
+    """
+    context = SimpleContextManager(
+        max_tokens=100,  # Very low to force extreme compaction
+        compact_threshold=0.3,  # Trigger compaction early
+        target_usage=0.2,  # Very aggressive target
+        truncate_chars=20,  # Aggressive truncation
+        protected_recent=0.1,  # Minimal protection to maximize pressure
+        protected_tool_results=1,  # Only protect 1 tool result
+    )
+
+    # Add a large system message (simulating the ~143KB system prompt scenario)
+    large_system_content = "You are a helpful assistant. " + ("x" * 500)
+    await context.add_message({"role": "system", "content": large_system_content})
+
+    # Add many messages with large tool results to create extreme pressure
+    for i in range(30):
+        await context.add_message({"role": "user", "content": f"request {i} with extra content"})
+        await context.add_message({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": f"tool_{i}", "type": "function", "function": {"name": "read"}}],
+        })
+        # Large tool result
+        await context.add_message({
+            "role": "tool",
+            "tool_call_id": f"tool_{i}",
+            "content": "result " + ("y" * 200),
+        })
+        await context.add_message({"role": "assistant", "content": f"response {i}"})
+
+    # Trigger compaction - this should hit Level 7 or 8 due to extreme pressure
+    messages = await context.get_messages_for_request()
+
+    # CRITICAL: System message MUST be preserved
+    system_messages = [m for m in messages if m.get("role") == "system"]
+    assert len(system_messages) == 1, (
+        f"System message was DROPPED during compaction! "
+        f"Found {len(system_messages)} system messages. "
+        f"This is the exact bug we fixed - system messages must NEVER be removed."
+    )
+    assert system_messages[0]["content"] == large_system_content, (
+        "System message content was modified during compaction! "
+        "System messages must be preserved exactly as-is."
+    )
+    
+    # Verify system message is at the beginning
+    assert messages[0].get("role") == "system", (
+        "System message must be at the beginning of the message list"
+    )
+
+
+@pytest.mark.asyncio
 async def test_truncation_marker_prevents_re_truncation():
     """Already truncated messages are not truncated again."""
     context = SimpleContextManager(
