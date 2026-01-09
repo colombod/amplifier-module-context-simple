@@ -196,12 +196,15 @@ class SimpleContextManager:
         # Determine working messages based on whether factory is set
         if self._system_prompt_factory:
             # Factory mode: get fresh system content, exclude stored system messages
+            # BUT preserve hook-injected system messages (they have metadata.source = "hook")
             system_content = await self._system_prompt_factory()
             system_message = {"role": "system", "content": system_content}
 
-            # Filter out any static system messages - factory takes precedence
+            # Filter out static system messages but keep hook-injected ones
+            # Hook injections have metadata.source = "hook" and should be preserved
             conversation_messages = [
-                msg for msg in self.messages if msg.get("role") != "system"
+                msg for msg in self.messages 
+                if msg.get("role") != "system" or msg.get("metadata", {}).get("source") == "hook"
             ]
             working_messages = [system_message] + conversation_messages
             logger.debug(
