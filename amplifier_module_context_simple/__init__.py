@@ -247,6 +247,24 @@ class SimpleContextManager:
         self.messages = []
         logger.info("Context cleared")
 
+    async def should_compact(self) -> bool:
+        """Check if context should be compacted.
+
+        Note: This module uses ephemeral compaction during get_messages_for_request(),
+        so this always returns False. The actual compaction check happens internally.
+        This method exists to satisfy the ContextManager protocol.
+        """
+        return False
+
+    async def compact(self) -> None:
+        """Compact the context.
+
+        Note: This module uses ephemeral compaction during get_messages_for_request(),
+        so this is a no-op. Compaction happens automatically when getting messages.
+        This method exists to satisfy the ContextManager protocol.
+        """
+        pass
+
     def _should_compact(self, token_count: int, budget: int) -> bool:
         """Check if context should be compacted."""
         usage = token_count / budget if budget > 0 else 0
