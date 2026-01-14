@@ -42,6 +42,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - protected_recent: Always protect last N% of messages (default: 0.30)
             - protected_tool_results: Always protect last N tool results (default: 5)
             - truncate_chars: Characters to keep when truncating tool results (default: 250)
+            - compaction_notice_enabled: Enable compaction notice (default: True)
+            - compaction_notice_token_reserve: Tokens to reserve for notice (default: 800)
+            - compaction_notice_verbosity: Notice detail level - "minimal", "normal", "verbose" (default: "normal")
+            - compaction_notice_min_level: Only show notice if compaction level >= this (default: 1)
 
     Returns:
         Optional cleanup function
@@ -54,6 +58,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         protected_recent=config.get("protected_recent", 0.30),
         protected_tool_results=config.get("protected_tool_results", 5),
         truncate_chars=config.get("truncate_chars", 250),
+        compaction_notice_enabled=config.get("compaction_notice_enabled", True),
+        compaction_notice_token_reserve=config.get(
+            "compaction_notice_token_reserve", 800
+        ),
+        compaction_notice_verbosity=config.get("compaction_notice_verbosity", "normal"),
+        compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
         hooks=getattr(coordinator, "hooks", None),
     )
     await coordinator.mount("context", context)
@@ -75,9 +85,9 @@ class SimpleContextManager:
 
     Compaction Strategy (Progressive Interleaved):
     Triggered when usage >= compact_threshold (default 92%), target is target_usage (default 50%).
-    
+
     Each level checks after every operation and stops as soon as target is reached:
-    
+
     Level 1: Truncate oldest 25% of tool results
     Level 2: Truncate next 25% of tool results (now 50% truncated)
     Level 3: Remove oldest messages (use configured protected_recent)
@@ -86,7 +96,7 @@ class SimpleContextManager:
     Level 6: Truncate remaining tool results (except last N)
     Level 7: Remove more messages (30% of configured protection - last resort)
     Level 8: Stub first user message + remove old stubs (extreme pressure)
-    
+
     This interleaved approach ensures minimal data loss by:
     - Preferring truncation (preserves structure) over removal (loses context)
     - Progressively relaxing protection as pressure increases
@@ -103,6 +113,10 @@ class SimpleContextManager:
         protected_recent: float = 0.30,
         protected_tool_results: int = 5,
         truncate_chars: int = 250,
+        compaction_notice_enabled: bool = True,
+        compaction_notice_token_reserve: int = 800,
+        compaction_notice_verbosity: str = "normal",
+        compaction_notice_min_level: int = 1,
         hooks: Any = None,
     ):
         """
@@ -115,6 +129,10 @@ class SimpleContextManager:
             protected_recent: Always protect last N% of messages (0.0-1.0)
             protected_tool_results: Always protect last N tool results from truncation
             truncate_chars: Characters to keep when truncating tool results
+            compaction_notice_enabled: Enable compaction notice injection
+            compaction_notice_token_reserve: Tokens to reserve for notice
+            compaction_notice_verbosity: Notice detail level ("minimal", "normal", "verbose")
+            compaction_notice_min_level: Only show notice if compaction level >= this
             hooks: Optional hooks instance for emitting observability events
         """
         self.messages: list[dict[str, Any]] = []
@@ -124,6 +142,10 @@ class SimpleContextManager:
         self.protected_recent = protected_recent
         self.protected_tool_results = protected_tool_results
         self.truncate_chars = truncate_chars
+        self.compaction_notice_enabled = compaction_notice_enabled
+        self.compaction_notice_token_reserve = compaction_notice_token_reserve
+        self.compaction_notice_verbosity = compaction_notice_verbosity
+        self.compaction_notice_min_level = compaction_notice_min_level
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
@@ -183,6 +205,10 @@ class SimpleContextManager:
         Applies EPHEMERAL compaction if needed - returns a NEW list without
         modifying self.messages. The original history is always preserved.
 
+        If compaction occurs and notice is enabled, a system-reminder is inserted
+        at position 1 (after main system message) to inform the LLM about what
+        was compacted.
+
         Args:
             token_budget: Optional explicit token limit (deprecated, prefer provider).
             provider: Optional provider instance for dynamic budget calculation.
@@ -192,6 +218,15 @@ class SimpleContextManager:
             Messages ready for LLM request, compacted if necessary.
         """
         budget = self._calculate_budget(token_budget, provider)
+
+        # Reserve token budget for potential compaction notice (if enabled)
+        effective_budget = budget
+        if self.compaction_notice_enabled:
+            effective_budget = budget - self.compaction_notice_token_reserve
+            logger.debug(
+                f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
+                f"(effective budget: {effective_budget:,})"
+            )
 
         # Determine working messages based on whether factory is set
         if self._system_prompt_factory:
@@ -203,8 +238,10 @@ class SimpleContextManager:
             # Filter out static system messages but keep hook-injected ones
             # Hook injections have metadata.source = "hook" and should be preserved
             conversation_messages = [
-                msg for msg in self.messages 
-                if msg.get("role") != "system" or msg.get("metadata", {}).get("source") == "hook"
+                msg
+                for msg in self.messages
+                if msg.get("role") != "system"
+                or msg.get("metadata", {}).get("source") == "hook"
             ]
             working_messages = [system_message] + conversation_messages
             logger.debug(
@@ -217,13 +254,39 @@ class SimpleContextManager:
 
         token_count = self._estimate_tokens(working_messages)
 
-        # Check if compaction needed
-        if self._should_compact(token_count, budget):
+        # Check if compaction needed (using effective budget with notice reserve deducted)
+        if self._should_compact(token_count, effective_budget):
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
-            compacted = await self._compact_ephemeral(budget, working_messages)
+            compacted = await self._compact_ephemeral(
+                effective_budget, working_messages
+            )
             logger.info(
                 f"Ephemeral compaction: {len(working_messages)} -> {len(compacted)} messages for this request"
             )
+
+            # Insert compaction notice if enabled and level threshold met
+            if self.compaction_notice_enabled and self._last_compaction_stats:
+                level = self._last_compaction_stats.get("strategy_level", 0)
+                if level >= self.compaction_notice_min_level:
+                    notice = self._format_compaction_notice()
+                    if notice:
+                        # Insert at position 1 (after main system message at position 0)
+                        compacted.insert(
+                            1,
+                            {
+                                "role": "system",
+                                "content": notice,
+                                "metadata": {
+                                    "source": "context-compaction",
+                                    "ephemeral": True,
+                                },
+                            },
+                        )
+                        logger.debug(
+                            f"Inserted compaction notice at position 1 (level {level}, "
+                            f"verbosity: {self.compaction_notice_verbosity})"
+                        )
+
             return compacted
 
         return working_messages
@@ -305,7 +368,9 @@ class SimpleContextManager:
             source_messages: Messages to compact. If None, uses self.messages.
                              This allows compacting factory-generated message lists.
         """
-        messages_to_compact = source_messages if source_messages is not None else self.messages
+        messages_to_compact = (
+            source_messages if source_messages is not None else self.messages
+        )
         target_tokens = int(budget * self.target_usage)
         old_count = len(messages_to_compact)
         old_tokens = self._estimate_tokens(messages_to_compact)
@@ -318,16 +383,20 @@ class SimpleContextManager:
         # === CRITICAL: Extract system messages FIRST - they are NEVER compacted ===
         # System messages contain the agent's identity and instructions. Losing them
         # causes the agent to lose its persona and capabilities mid-conversation.
-        system_messages = [dict(msg) for msg in messages_to_compact if msg.get("role") == "system"]
-        non_system_messages = [msg for msg in messages_to_compact if msg.get("role") != "system"]
-        
+        system_messages = [
+            dict(msg) for msg in messages_to_compact if msg.get("role") == "system"
+        ]
+        non_system_messages = [
+            msg for msg in messages_to_compact if msg.get("role") != "system"
+        ]
+
         if system_messages:
             system_tokens = self._estimate_tokens(system_messages)
             logger.info(
                 f"Preserving {len(system_messages)} system message(s) ({system_tokens:,} tokens) - "
                 f"these are NEVER compacted"
             )
-        
+
         # Work on non-system messages only - system messages bypass all compaction
         working_messages = [dict(msg) for msg in non_system_messages]
         current_tokens = old_tokens
@@ -337,15 +406,17 @@ class SimpleContextManager:
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
         total_tools = len(tool_result_indices)
-        
+
         # Always protect the last N tool results from truncation
-        protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
-        
+        protected_tool_indices = set(
+            tool_result_indices[-self.protected_tool_results :]
+        )
+
         # Calculate wave boundaries (25% chunks)
         wave1_end = int(total_tools * 0.25)
         wave2_end = int(total_tools * 0.50)
         wave3_end = int(total_tools * 0.75)
-        
+
         total_truncated = 0
         total_removed = 0
         total_stubbed = 0
@@ -353,44 +424,80 @@ class SimpleContextManager:
 
         # === LEVEL 1: Truncate oldest 25% of tool results ===
         truncated, current_tokens = self._truncate_tool_wave(
-            working_messages, tool_result_indices[:wave1_end],
-            protected_tool_indices, target_tokens, current_tokens
+            working_messages,
+            tool_result_indices[:wave1_end],
+            protected_tool_indices,
+            target_tokens,
+            current_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
             logger.info(f"Level 1: Truncated {truncated} tool results, reached target")
             return await self._finalize_compaction_with_stats(
-                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-                total_stubbed, max_level_reached, budget, target_tokens
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                total_removed,
+                total_truncated,
+                total_stubbed,
+                max_level_reached,
+                budget,
+                target_tokens,
             )
 
         # === LEVEL 2: Truncate next 25% (now 50% truncated) ===
         max_level_reached = 2
         truncated, current_tokens = self._truncate_tool_wave(
-            working_messages, tool_result_indices[wave1_end:wave2_end],
-            protected_tool_indices, target_tokens, current_tokens
+            working_messages,
+            tool_result_indices[wave1_end:wave2_end],
+            protected_tool_indices,
+            target_tokens,
+            current_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
-            logger.info(f"Level 2: Truncated {truncated} more tool results, reached target")
+            logger.info(
+                f"Level 2: Truncated {truncated} more tool results, reached target"
+            )
             return await self._finalize_compaction_with_stats(
-                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-                total_stubbed, max_level_reached, budget, target_tokens
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                total_removed,
+                total_truncated,
+                total_stubbed,
+                max_level_reached,
+                budget,
+                target_tokens,
             )
 
         # === LEVEL 3: Remove oldest messages (use configured protection) ===
         max_level_reached = 3
         level3_protection = self.protected_recent  # Use configured value
-        working_messages, removed, stubbed, current_tokens = self._remove_messages_with_protection(
-            working_messages, target_tokens, protected_recent=level3_protection
+        working_messages, removed, stubbed, current_tokens = (
+            self._remove_messages_with_protection(
+                working_messages, target_tokens, protected_recent=level3_protection
+            )
         )
         total_removed += removed
         total_stubbed += stubbed
         if current_tokens <= target_tokens:
-            logger.info(f"Level 3: Removed {removed} messages, stubbed {stubbed} ({level3_protection:.0%} protected), reached target")
+            logger.info(
+                f"Level 3: Removed {removed} messages, stubbed {stubbed} ({level3_protection:.0%} protected), reached target"
+            )
             return await self._finalize_compaction_with_stats(
-                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-                total_stubbed, max_level_reached, budget, target_tokens
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                total_removed,
+                total_truncated,
+                total_stubbed,
+                max_level_reached,
+                budget,
+                target_tokens,
             )
 
         # === LEVEL 4: Truncate next 25% (now 75% truncated) ===
@@ -399,35 +506,62 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
+        protected_tool_indices = set(
+            tool_result_indices[-self.protected_tool_results :]
+        )
         wave3_start = int(len(tool_result_indices) * 0.50)
         wave3_end = int(len(tool_result_indices) * 0.75)
-        
+
         truncated, current_tokens = self._truncate_tool_wave(
-            working_messages, tool_result_indices[wave3_start:wave3_end],
-            protected_tool_indices, target_tokens, current_tokens
+            working_messages,
+            tool_result_indices[wave3_start:wave3_end],
+            protected_tool_indices,
+            target_tokens,
+            current_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
-            logger.info(f"Level 4: Truncated {truncated} more tool results, reached target")
+            logger.info(
+                f"Level 4: Truncated {truncated} more tool results, reached target"
+            )
             return await self._finalize_compaction_with_stats(
-                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-                total_stubbed, max_level_reached, budget, target_tokens
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                total_removed,
+                total_truncated,
+                total_stubbed,
+                max_level_reached,
+                budget,
+                target_tokens,
             )
 
         # === LEVEL 5: Remove more messages (60% of configured protection) ===
         max_level_reached = 5
         level5_protection = self.protected_recent * 0.6
-        working_messages, removed, stubbed, current_tokens = self._remove_messages_with_protection(
-            working_messages, target_tokens, protected_recent=level5_protection
+        working_messages, removed, stubbed, current_tokens = (
+            self._remove_messages_with_protection(
+                working_messages, target_tokens, protected_recent=level5_protection
+            )
         )
         total_removed += removed
         total_stubbed += stubbed
         if current_tokens <= target_tokens:
-            logger.info(f"Level 5: Removed {removed} messages, stubbed {stubbed} ({level5_protection:.0%} protected), reached target")
+            logger.info(
+                f"Level 5: Removed {removed} messages, stubbed {stubbed} ({level5_protection:.0%} protected), reached target"
+            )
             return await self._finalize_compaction_with_stats(
-                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-                total_stubbed, max_level_reached, budget, target_tokens
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                total_removed,
+                total_truncated,
+                total_stubbed,
+                max_level_reached,
+                budget,
+                target_tokens,
             )
 
         # === LEVEL 6: Truncate remaining tool results (except last N) ===
@@ -435,29 +569,46 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(tool_result_indices[-self.protected_tool_results:])
-        
+        protected_tool_indices = set(
+            tool_result_indices[-self.protected_tool_results :]
+        )
+
         truncated, current_tokens = self._truncate_tool_wave(
-            working_messages, tool_result_indices,
-            protected_tool_indices, target_tokens, current_tokens
+            working_messages,
+            tool_result_indices,
+            protected_tool_indices,
+            target_tokens,
+            current_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
-            logger.info(f"Level 6: Truncated {truncated} remaining tool results, reached target")
+            logger.info(
+                f"Level 6: Truncated {truncated} remaining tool results, reached target"
+            )
             return await self._finalize_compaction_with_stats(
-                working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-                total_stubbed, max_level_reached, budget, target_tokens
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                total_removed,
+                total_truncated,
+                total_stubbed,
+                max_level_reached,
+                budget,
+                target_tokens,
             )
 
         # === LEVEL 7: Remove more messages (30% of configured protection - last resort) ===
         max_level_reached = 7
         level7_protection = self.protected_recent * 0.3
-        working_messages, removed, stubbed, current_tokens = self._remove_messages_with_protection(
-            working_messages, target_tokens, protected_recent=level7_protection
+        working_messages, removed, stubbed, current_tokens = (
+            self._remove_messages_with_protection(
+                working_messages, target_tokens, protected_recent=level7_protection
+            )
         )
         total_removed += removed
         total_stubbed += stubbed
-        
+
         logger.info(
             f"Level 7 complete ({level7_protection:.0%} protected): "
             f"Truncated {total_truncated} total, removed {total_removed} total, stubbed {total_stubbed} total. "
@@ -468,7 +619,7 @@ class SimpleContextManager:
         if current_tokens > target_tokens:
             # === LEVEL 8: Stub first user message + remove old stubs (extreme pressure) ===
             max_level_reached = 8
-            
+
             # Find first user message and stub it if not already stubbed
             first_user_idx = None
             last_user_idx = None
@@ -477,7 +628,7 @@ class SimpleContextManager:
                     if first_user_idx is None:
                         first_user_idx = i
                     last_user_idx = i
-            
+
             # Stub first user message (previously protected) - but NEVER if it's also the last
             # The last user message is the current intent and must always be preserved
             if first_user_idx is not None and first_user_idx != last_user_idx:
@@ -485,22 +636,29 @@ class SimpleContextManager:
                 if not first_msg.get("_stubbed"):
                     content = first_msg.get("content", "")
                     if isinstance(content, str) and len(content) > 80:
-                        working_messages[first_user_idx] = self._stub_user_message(first_msg)
+                        working_messages[first_user_idx] = self._stub_user_message(
+                            first_msg
+                        )
                         total_stubbed += 1
                         savings = (len(content) - 70) // 4
                         current_tokens -= savings
-                        logger.info(f"Level 8: Stubbed first user message (saved ~{savings} tokens)")
-            
+                        logger.info(
+                            f"Level 8: Stubbed first user message (saved ~{savings} tokens)"
+                        )
+
             # Remove old stubs if still over target (oldest first, outside protected zone)
             if current_tokens > target_tokens:
-                protected_boundary = int(len(working_messages) * (1 - level7_protection))
+                protected_boundary = int(
+                    len(working_messages) * (1 - level7_protection)
+                )
                 old_stub_indices = [
-                    i for i, msg in enumerate(working_messages)
+                    i
+                    for i, msg in enumerate(working_messages)
                     if msg.get("_stubbed")
                     and i < protected_boundary  # Outside protected recent zone
                     and i != last_user_idx  # Never remove last user message
                 ]
-                
+
                 stubs_removed = 0
                 indices_to_remove = set()
                 for i in old_stub_indices:  # Already sorted oldest-first
@@ -509,24 +667,33 @@ class SimpleContextManager:
                     indices_to_remove.add(i)
                     stubs_removed += 1
                     current_tokens -= 18  # Stub is ~70 chars = ~18 tokens
-                
+
                 if indices_to_remove:
                     working_messages = [
-                        msg for i, msg in enumerate(working_messages)
+                        msg
+                        for i, msg in enumerate(working_messages)
                         if i not in indices_to_remove
                     ]
                     total_removed += stubs_removed
                     logger.info(f"Level 8: Removed {stubs_removed} old user stubs")
-            
+
             logger.info(
                 f"Level 8 complete (extreme pressure): "
                 f"Stubbed {total_stubbed} total, removed {total_removed} total. "
                 f"Tokens: {old_tokens:,} → {current_tokens:,}"
             )
-        
+
         return await self._finalize_compaction_with_stats(
-            working_messages, system_messages, old_count, old_tokens, total_removed, total_truncated,
-            total_stubbed, max_level_reached, budget, target_tokens
+            working_messages,
+            system_messages,
+            old_count,
+            old_tokens,
+            total_removed,
+            total_truncated,
+            total_stubbed,
+            max_level_reached,
+            budget,
+            target_tokens,
         )
 
     def _truncate_tool_wave(
@@ -539,7 +706,7 @@ class SimpleContextManager:
     ) -> tuple[int, int]:
         """
         Truncate a wave of tool results, stopping when target is reached.
-        
+
         Returns (truncated_count, new_token_count).
         """
         truncated = 0
@@ -567,9 +734,9 @@ class SimpleContextManager:
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
-        
+
         User messages are NEVER removed - they may be stubbed if still over target.
-        
+
         Returns (new_messages, removed_count, stubbed_count, new_token_count).
         """
         # Determine protected indices
@@ -609,7 +776,8 @@ class SimpleContextManager:
 
         # Removal candidates exclude ALL user messages (they can only be stubbed, not removed)
         removal_candidates = [
-            i for i in range(len(messages))
+            i
+            for i in range(len(messages))
             if i not in protected_indices and i not in user_message_indices
         ]
 
@@ -652,13 +820,16 @@ class SimpleContextManager:
         # After removals, stub intermediate user messages if still over target
         # At normal levels (1-7), still protect first/last from stubbing
         # Level 8 will handle first user message stubbing separately
-        stub_candidates = sorted([
-            i for i in user_message_indices
-            if i not in protected_indices
-            and i != first_user_idx  # Protected from stubbing at levels 1-7
-            and i != last_user_idx   # Always protected (never stubbed)
-            and not messages[i].get("_stubbed")  # Don't re-stub
-        ])
+        stub_candidates = sorted(
+            [
+                i
+                for i in user_message_indices
+                if i not in protected_indices
+                and i != first_user_idx  # Protected from stubbing at levels 1-7
+                and i != last_user_idx  # Always protected (never stubbed)
+                and not messages[i].get("_stubbed")  # Don't re-stub
+            ]
+        )
 
         indices_to_stub = set()
         for i in stub_candidates:
@@ -699,12 +870,12 @@ class SimpleContextManager:
             if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
                 if j in protected_indices:
                     return False  # Can't remove protected assistant
-                
+
                 # Check if ALL tool_results for this assistant can be removed
                 all_removable, tool_result_indices = self._check_tool_pair_removable(
                     messages, check_msg, protected_indices
                 )
-                
+
                 if all_removable:
                     indices_to_remove.add(j)
                     for k in tool_result_indices:
@@ -727,7 +898,7 @@ class SimpleContextManager:
         all_removable, tool_result_indices = self._check_tool_pair_removable(
             messages, assistant_msg, protected_indices
         )
-        
+
         if all_removable:
             indices_to_remove.add(assistant_idx)
             for k in tool_result_indices:
@@ -744,7 +915,7 @@ class SimpleContextManager:
         """Check if all tool results for an assistant can be removed. Returns (all_removable, result_indices)."""
         all_removable = True
         tool_result_indices = []
-        
+
         for tc in assistant_msg.get("tool_calls", []):
             tc_id = tc.get("id") or tc.get("tool_call_id")
             if tc_id:
@@ -754,7 +925,7 @@ class SimpleContextManager:
                             all_removable = False
                         else:
                             tool_result_indices.append(k)
-        
+
         return all_removable, tool_result_indices
 
     async def _finalize_compaction_with_stats(
@@ -771,19 +942,19 @@ class SimpleContextManager:
         target_tokens: int,
     ) -> list[dict[str, Any]]:
         """Log final compaction state, store stats, emit event, and return the result.
-        
+
         CRITICAL: This function prepends the preserved system messages to the compacted
         working messages, ensuring system messages are ALWAYS in the final result.
         """
         # === CRITICAL: Prepend system messages to final result ===
         # System messages were extracted before compaction and must be restored
         final_messages = system_messages + working_messages
-        
+
         final_tokens = self._estimate_tokens(final_messages)
         system_count = len(system_messages)
         tool_use_count = sum(1 for m in final_messages if m.get("tool_calls"))
         tool_result_count = sum(1 for m in final_messages if m.get("role") == "tool")
-        
+
         logger.info(
             f"Compaction complete: {old_count} → {len(final_messages)} messages, "
             f"{old_tokens:,} → {final_tokens:,} tokens "
@@ -791,7 +962,9 @@ class SimpleContextManager:
         )
 
         # === SANITY CHECK: Verify system messages are present ===
-        result_system_count = sum(1 for m in final_messages if m.get("role") == "system")
+        result_system_count = sum(
+            1 for m in final_messages if m.get("role") == "system"
+        )
         if result_system_count != system_count:
             logger.error(
                 f"CRITICAL: System message count mismatch! Expected {system_count}, got {result_system_count}. "
@@ -811,6 +984,8 @@ class SimpleContextManager:
             "strategy_level": max_level_reached,
             "budget": budget,
             "target_tokens": target_tokens,
+            "protected_recent": self.protected_recent,
+            "protected_tool_results": self.protected_tool_results,
         }
         self._last_compaction_stats = stats
 
@@ -836,7 +1011,7 @@ class SimpleContextManager:
         original_tokens = len(content) // 4
         return {
             **msg,
-            "content": f"[truncated: ~{original_tokens:,} tokens - call tool again if needed] {content[:self.truncate_chars]}...",
+            "content": f"[truncated: ~{original_tokens:,} tokens - call tool again if needed] {content[: self.truncate_chars]}...",
             "_truncated": True,
             "_original_tokens": original_tokens,
         }
@@ -863,6 +1038,100 @@ class SimpleContextManager:
             "_original_length": len(content),
         }
 
+    def _format_compaction_notice(self) -> str:
+        """
+        Format compaction notice based on last compaction stats.
+
+        This method can be overridden by subclasses to customize the notice
+        format for different compaction strategies.
+
+        Returns:
+            Formatted notice string, or empty string if no stats available.
+        """
+        if not self._last_compaction_stats:
+            return ""
+
+        stats = self._last_compaction_stats
+        level = stats.get("strategy_level", 0)
+
+        # Handle different verbosity levels
+        if self.compaction_notice_verbosity == "minimal":
+            return (
+                '<system-reminder source="context-compaction">\n'
+                "Context has been compacted to fit within token budget. "
+                "Some older messages and tool results may be truncated.\n"
+                "</system-reminder>"
+            )
+
+        # Build level-specific affected items (for normal and verbose)
+        affected = self._format_affected_items(level, stats)
+
+        # Normal verbosity (default)
+        old_count = stats.get("before_messages", 0)
+        new_count = stats.get("after_messages", 0)
+        removed = stats.get("messages_removed", 0)
+        stubbed = stats.get("user_messages_stubbed", 0)
+        truncated = stats.get("messages_truncated", 0)
+        old_tokens = stats.get("before_tokens", 0)
+        new_tokens = stats.get("after_tokens", 0)
+        target_tokens = stats.get("target_tokens", 0)
+        protected_recent = stats.get("protected_recent", 0.0)
+        protected_tool_results = stats.get("protected_tool_results", 0)
+
+        notice = f"""<system-reminder source="context-compaction">
+Context has been compacted to fit within token budget.
+
+Compaction summary:
+- Strategy level: {level}/8
+- Messages: {old_count} → {new_count} ({removed} removed, {stubbed} stubbed)
+- Tool results: {truncated} truncated
+- Tokens: {old_tokens:,} → {new_tokens:,} (target: {target_tokens:,})
+
+What was preserved:
+- All system messages (your instructions and identity)
+- Last user message (current task)
+- Recent messages ({protected_recent:.0%} of conversation)
+- Last {protected_tool_results} tool results (full content)
+
+What may be affected:
+{affected}
+
+Note: This compaction is ephemeral (affects only this request). Full history is preserved in session transcript.
+</system-reminder>"""
+
+        return notice
+
+    def _format_affected_items(self, level: int, stats: dict[str, Any]) -> str:
+        """
+        Format affected items based on compaction level.
+
+        Args:
+            level: Compaction strategy level (1-8)
+            stats: Compaction statistics dictionary
+
+        Returns:
+            Formatted string describing what may be affected at this level.
+        """
+        if level <= 2:
+            return (
+                '- Older tool results are truncated with "[truncated: ~N tokens]" prefix\n'
+                "- You can re-run tools if you need the full output"
+            )
+        elif level <= 5:
+            return (
+                '- Older tool results are truncated with "[truncated: ~N tokens]" prefix\n'
+                "- Older conversation messages have been removed\n"
+                "- You can re-run tools if you need full output"
+            )
+        else:  # level 6-8
+            n = stats.get("protected_tool_results", 5)
+            return (
+                f"- Most tool results are truncated (except last {n})\n"
+                "- Significant conversation history has been removed\n"
+                '- Some user messages may be stubbed as "[User message compacted...]"\n'
+                "- If context is critical, consider asking user to clarify their current goal"
+            )
+
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
         """Calculate effective token budget from provider or fallback to config.
 
@@ -882,7 +1151,9 @@ class SimpleContextManager:
             return token_budget
 
         safety_margin = 1000  # Buffer to avoid hitting hard limits
-        output_reserve_fraction = 0.5  # Reserve 50% of max output (most responses are smaller)
+        output_reserve_fraction = (
+            0.5  # Reserve 50% of max output (most responses are smaller)
+        )
 
         # Try provider-based dynamic budget
         if provider is not None:
