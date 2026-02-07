@@ -22,6 +22,7 @@ __amplifier_module_type__ = "context"
 
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -158,7 +159,21 @@ class SimpleContextManager:
 
         Tool results MUST be added even if over threshold, otherwise
         tool_use/tool_result pairing breaks.
+
+        Timestamps are automatically added to message metadata for replay timing.
+        Existing timestamps and metadata are preserved.
         """
+        # Add timestamp in metadata if not already present (for replay timing)
+        existing_meta = message.get("metadata", {})
+        if "timestamp" not in existing_meta:
+            message = {
+                **message,
+                "metadata": {
+                    **existing_meta,
+                    "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                },
+            }
+
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
 
